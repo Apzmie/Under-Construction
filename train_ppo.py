@@ -294,7 +294,6 @@ if __name__ == "__main__":
                         i = test_id_to_index[agent_id]
                         if not test_episode_dones[i]:
                             test_rewards[i] += t_decision_steps.reward[j]
-
                             
                 test_average_reward = np.mean(test_rewards)
                 test_rewards_std = np.std(test_rewards)
