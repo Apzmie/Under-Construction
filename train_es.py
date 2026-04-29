@@ -165,7 +165,7 @@ if __name__ == "__main__":
 
         pseudo_gradient = agent.update(torch.tensor(total_rewards, dtype=torch.float32), noise_list, base_weights)
         update_count += 1
-        #agent.model.action_scale = max(1.0, agent.model.action_scale * 0.9)    # 5 -> 16
+        #agent.model.action_scale = max(1.0, agent.model.action_scale * 0.9)
         #max_step = max(200, max_step_count * 2)
 
         avg_reward = np.mean(total_rewards)
