@@ -1,5 +1,5 @@
 # Under-Construction
-Making an agent walk with legs using reinforcement learning in Unity was a real challenge for me. After several attempts, it finally worked with two main factors: Rad/Deg conversion and Evolution Strategies. 
+Making an agent walk with legs using reinforcement learning in Unity was a real challenge for me. After several attempts, it finally worked with two main factors: Rad/Deg conversion and Evolution Strategies. Configurable Joint could not be used because it did not behave like a rigid connection, which made Articulation Body necessary.
 
 ## Environment
 ### Unity
