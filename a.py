@@ -200,6 +200,44 @@ class WorldModel(nn.Module):
         self.decoder = Decoder(state_dim)
         self.reward_model = RewardModel()
         
+    def loss(self, states, actions, rewards, initial_memory, initial_latent):
+        embeds = self.encoder(states)
+        memories, latents, prior_means, prior_stds, posterior_means, posterior_stds = self.rssm.observe(embeds, actions, initial_memory, initial_latent)
+        
+        recons = self.decoder(memories, latents)
+        pred_rewards = self.reward_model(memories, latents)
+        
+        recon_loss = F.mse_loss(states, recons)
+        reward_loss = F.mse_loss(rewards, pred_rewards)
+        
+        prior_dist = torch.distributions.Normal(prior_means, prior_stds)
+        posterior_dist = torch.distributions.Normal(posterior_means, posterior_stds)
+        dist_loss = torch.distributions.kl_divergence(posterior_dist, prior_dist).mean()
+        
+        total_loss = recon_loss + reward_loss + dist_loss
+                
+        return {
+            "total_loss": total_loss,
+            "reconstruction_loss": recon_loss,
+            "reward_loss": reward_loss,
+            "distribution_loss": dist_loss,
+        }
+        
+        
+class Agent:
+    def __init__(self, state_dim, action_dim):
+        self.world_model = WorldModel(state_dim, action_dim)
+        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=1e-3)
+        
+    def update_world_model(self, states, actions, rewards, initial_memory, initial_latent):
+        losses = self.world_model.loss(states, actions, rewards, initial_memory, initial_latent)        
+        self.world_model_optimizer.zero_grad()
+        losses["total_loss"].backward()
+        self.world_model_optimizer.step()
+                
+        return losses
+
+        
         
         
         
