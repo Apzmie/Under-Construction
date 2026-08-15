@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter 
 
-BASE_DIR = "/home/psh/Two/a"
+BASE_DIR = ""
 
 
 class Encoder(nn.Module):
