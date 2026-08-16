@@ -272,6 +272,11 @@ class Actor(nn.Module):
         action = dist.rsample()
         action = torch.tanh(action)
         return action
+        
+    def deterministic(memory, latent):
+        mean, _ = forward(memory, latent)
+        mean = torch.tanh(mean)
+        return mean
 
 
 class Critic(nn.Module):
@@ -331,9 +336,7 @@ class Agent:
         values = []
         
         for t in range(horizon):
-            mean, std = self.actor(memory, latent)
-            dist = torch.distributions.Normal(mean, std)
-            action = dist.rsample()
+            action = self.actor.sample(memory, latent)
             
             memory = self.world_model.rssm.gru(latent, action, memory)
             prior_mean, prior_std = self.world_model.rssm.prior(memory)
@@ -422,7 +425,7 @@ class Agent:
 
 
 class ReplayBuffer:
-    def __init__(self, max_episodes=1000, batch_size=256, sequence_length=5):
+    def __init__(self, max_episodes=1000, batch_size=256, sequence_length=10):
         self.max_episodes = max_episodes
         self.batch_size = batch_size
         self.sequence_length = sequence_length
@@ -485,6 +488,8 @@ if __name__ == "__main__":
     agent = Agent(state_dim, action_dim)
     buffer = ReplayBuffer()    
     writer = SummaryWriter(log_dir=BASE_DIR)
+    
+    test_interval = 1000
     
     episode_states = {}
     episode_actions = {}
@@ -565,7 +570,9 @@ if __name__ == "__main__":
                 print(
                     "Episode finished:",
                     len(episode_states[agent_id]),
-                    "steps | buffer:",
+                    "steps | reward:",
+                    sum(episode_rewards[agent_id]),
+                    "| buffer:",
                     len(buffer.episodes)
                 )
                 
@@ -575,7 +582,7 @@ if __name__ == "__main__":
                 del memories[agent_id]
                 del latents[agent_id]
         
-        if len(buffer.episodes) >= 10:
+        if len(buffer.episodes) >= 50:
             batch = buffer.sample()
             
             states = batch["states"]
@@ -604,7 +611,9 @@ if __name__ == "__main__":
             actor_loss = agent.update_actor(imagination_memory.detach(), imagination_latent.detach())
             writer.add_scalar("Train/Actor_loss", actor_loss.item(), update_count)      
         
-        
+            if update_count % test_interval == 0:
+                print(f"Update Count {update_count}")
+                test_env.reset()
         
         
         
