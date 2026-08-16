@@ -1,6 +1,7 @@
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.side_channel.engine_configuration_channel import EngineConfigurationChannel
 from mlagents_envs.base_env import ActionTuple
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -214,7 +215,7 @@ class WorldModel(nn.Module):
         pred_rewards = self.reward_model(memories, latents)
         
         recon_loss = F.mse_loss(states, recons)
-        reward_loss = F.mse_loss(rewards, pred_rewards)
+        reward_loss = F.mse_loss(rewards.unsqueeze(-1), pred_rewards)
         
         prior_dist = torch.distributions.Normal(prior_means, prior_stds)
         posterior_dist = torch.distributions.Normal(posterior_means, posterior_stds)
@@ -242,6 +243,9 @@ class WorldModel(nn.Module):
             "reconstruction_loss": recon_loss,
             "reward_loss": reward_loss,
             "distribution_loss": dist_loss,
+            
+            "memories": memories,
+            "latents": latents,
         }
         
 
@@ -266,6 +270,7 @@ class Actor(nn.Module):
         mean, std = self.forward(memory, latent)
         dist = torch.distributions.Normal(mean, std)
         action = dist.rsample()
+        action = torch.tanh(action)
         return action
 
 
@@ -295,10 +300,23 @@ class Agent:
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
         
     def update_world_model(self, states, actions, rewards, initial_memory, initial_latent):
+        for param in self.actor.parameters():
+            param.requires_grad = False
+
+        for param in self.critic.parameters():
+           param.requires_grad = False
+           
         losses = self.world_model.loss(states, actions, rewards, initial_memory, initial_latent)        
         self.world_model_optimizer.zero_grad()
         losses["total_loss"].backward()
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 10.0)
         self.world_model_optimizer.step()
+        
+        for param in self.actor.parameters():
+            param.requires_grad = True
+
+        for param in self.critic.parameters():
+            param.requires_grad = True
                 
         return losses
         
@@ -355,18 +373,34 @@ class Agent:
         return returns       
         
     def update_critic(self, initial_memory, initial_latent, horizon=15):
+        for param in self.actor.parameters():
+            param.requires_grad = False
+
+        for param in self.world_model.parameters():
+            param.requires_grad = False
+            
         memories, latents, actions, rewards, values = self.imagine_rollout(initial_memory, initial_latent, horizon)
         returns = self.compute_return(rewards, values)
         
         critic_loss = F.mse_loss(values, returns.detach())
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 10.0)
         self.critic_optimizer.step()
+        
+        for param in self.actor.parameters():
+            param.requires_grad = True
+
+        for param in self.world_model.parameters():
+            param.requires_grad = True
         
         return critic_loss
         
     def update_actor(self, initial_memory, initial_latent, horizon=15):
         for param in self.critic.parameters():
+            param.requires_grad = False
+            
+        for param in self.world_model.parameters():
             param.requires_grad = False
             
         memories, latents, actions, rewards, values = self.imagine_rollout(initial_memory, initial_latent, horizon)
@@ -375,16 +409,20 @@ class Agent:
         actor_loss = -returns.mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
         self.actor_optimizer.step()
         
         for param in self.critic.parameters():
+            param.requires_grad = True
+            
+        for param in self.world_model.parameters():
             param.requires_grad = True
             
         return actor_loss
 
 
 class ReplayBuffer:
-    def __init__(self, max_episodes=1000, batch_size=256, sequence_length=50):
+    def __init__(self, max_episodes=1000, batch_size=256, sequence_length=5):
         self.max_episodes = max_episodes
         self.batch_size = batch_size
         self.sequence_length = sequence_length
@@ -454,6 +492,8 @@ if __name__ == "__main__":
     memories = {}
     latents = {}
     
+    update_count = 0
+    
     while True:
         decision_steps, terminal_steps = env.get_steps(behavior_name)   
         agent_ids = decision_steps.agent_id
@@ -522,19 +562,54 @@ if __name__ == "__main__":
                     episode_rewards[agent_id]
                 )
                 
+                print(
+                    "Episode finished:",
+                    len(episode_states[agent_id]),
+                    "steps | buffer:",
+                    len(buffer.episodes)
+                )
+                
                 del episode_states[agent_id]
                 del episode_actions[agent_id]
                 del episode_rewards[agent_id]
                 del memories[agent_id]
                 del latents[agent_id]
-                 
+        
+        if len(buffer.episodes) >= 10:
+            batch = buffer.sample()
+            
+            states = batch["states"]
+            actions = batch["actions"]
+            rewards = batch["rewards"]  
+            
+            B = states.shape[0]
+            
+            initial_memory = torch.zeros(B, 256)
+            initial_latent = torch.zeros(B, 32)       
 
-        
-        
-        
-        
-                    
+            losses = agent.update_world_model(states, actions, rewards, initial_memory, initial_latent)
+            update_count += 1
+            
+            writer.add_scalar("Train/WorldModel_total_loss", losses["total_loss"].item(), update_count)
+            writer.add_scalar("Train/WorldModel_reconstruction_loss", losses["reconstruction_loss"].item(), update_count)
+            writer.add_scalar("Train/WorldModel_reward_loss", losses["reward_loss"].item(), update_count)
+            writer.add_scalar("Train/WorldModel_distribution_loss", losses["distribution_loss"].item(), update_count)
+            
+            imagination_memory = losses["memories"][:, -1, :]
+            imagination_latent = losses["latents"][:, -1, :]        
 
+            critic_loss = agent.update_critic(imagination_memory.detach(), imagination_latent.detach())
+            writer.add_scalar("Train/Critic_loss", critic_loss.item(), update_count)
+            
+            actor_loss = agent.update_actor(imagination_memory.detach(), imagination_latent.detach())
+            writer.add_scalar("Train/Actor_loss", actor_loss.item(), update_count)      
+        
+        
+        
+        
+        
+        
+        
         
         
         
