@@ -131,38 +131,7 @@ class RSSM(nn.Module):
         posterior_means = torch.stack(posterior_means, dim=1)
         posterior_stds = torch.stack(posterior_stds, dim=1)
         
-        return memories, latents, prior_means, prior_stds, posterior_means, posterior_stds
-                
-    def imagine(self, initial_memory, initial_latent, actions):
-        memory = initial_memory
-        latent = initial_latent
-        
-        memories = []
-        latents = []
-
-        prior_means = []
-        prior_stds = []
-        
-        T = actions.shape[1]
-        for t in range(T):
-            action = actions[:, t]
-            memory = self.gru(latent, action, memory)
-            prior_mean, prior_std = self.prior(memory)
-            latent = self.sample(prior_mean, prior_std)
-            
-            memories.append(memory)
-            latents.append(latent)
-            
-            prior_means.append(prior_mean)
-            prior_stds.append(prior_std)
-            
-        memories = torch.stack(memories, dim=1)
-        latents = torch.stack(latents, dim=1)
-        
-        prior_means = torch.stack(prior_means, dim=1)
-        prior_stds = torch.stack(prior_stds, dim=1)
-        
-        return memories, latents, prior_means, prior_stds
+        return memories, latents, prior_means, prior_stds, posterior_means, posterior_stds                 
             
 
 class Decoder(nn.Module):
@@ -221,18 +190,14 @@ class WorldModel(nn.Module):
         posterior_dist = torch.distributions.Normal(posterior_means, posterior_stds)
         
         prior_loss = torch.distributions.kl_divergence(
-            torch.distributions.Normal(
-                posterior_means.detach(),
-                posterior_stds.detach()
-            ),
-            prior_dist).mean()
+            torch.distributions.Normal(posterior_means.detach(), posterior_stds.detach()),
+            prior_dist
+        ).mean()
             
         posterior_loss = torch.distributions.kl_divergence(
             posterior_dist,
-            torch.distributions.Normal(
-                prior_means.detach(),
-                prior_stds.detach()
-            )).mean()
+            torch.distributions.Normal(prior_means.detach(), prior_stds.detach())
+        ).mean()
     
     
         dist_loss = alpha * prior_loss + (1 - alpha) * posterior_loss        
@@ -242,8 +207,7 @@ class WorldModel(nn.Module):
             "total_loss": total_loss,
             "reconstruction_loss": recon_loss,
             "reward_loss": reward_loss,
-            "distribution_loss": dist_loss,
-            
+            "distribution_loss": dist_loss,            
             "memories": memories,
             "latents": latents,
         }
@@ -273,8 +237,8 @@ class Actor(nn.Module):
         action = torch.tanh(action)
         return action
         
-    def deterministic(memory, latent):
-        mean, _ = forward(memory, latent)
+    def deterministic(self, memory, latent):
+        mean, _ = self.forward(memory, latent)
         mean = torch.tanh(mean)
         return mean
 
@@ -304,28 +268,16 @@ class Agent:
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
         
-    def update_world_model(self, states, actions, rewards, initial_memory, initial_latent):
-        for param in self.actor.parameters():
-            param.requires_grad = False
-
-        for param in self.critic.parameters():
-           param.requires_grad = False
-           
+    def update_world_model(self, states, actions, rewards, initial_memory, initial_latent):           
         losses = self.world_model.loss(states, actions, rewards, initial_memory, initial_latent)        
         self.world_model_optimizer.zero_grad()
         losses["total_loss"].backward()
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 10.0)
         self.world_model_optimizer.step()
-        
-        for param in self.actor.parameters():
-            param.requires_grad = True
-
-        for param in self.critic.parameters():
-            param.requires_grad = True
-                
+                        
         return losses
         
-    def imagine_rollout(self, initial_memory, initial_latent, horizon=15):
+    def imagine(self, initial_memory, initial_latent, horizon=15):
         memory = initial_memory
         latent = initial_latent
         
@@ -343,7 +295,7 @@ class Agent:
             
             latent = self.world_model.rssm.sample(prior_mean, prior_std)            
             reward = self.world_model.reward_model(memory, latent)            
-            value = self.critic(memory,latent)
+            value = self.critic(memory, latent)
             
             memories.append(memory)
             latents.append(latent)
@@ -355,6 +307,14 @@ class Agent:
         latents = torch.stack(latents, dim=1)
         actions = torch.stack(actions, dim=1)
         rewards = torch.stack(rewards, dim=1)
+        
+        action = self.actor.sample(memory, latent)
+        memory = self.world_model.rssm.gru(latent, action, memory)
+        prior_mean, prior_std = self.world_model.rssm.prior(memory)
+        latent = self.world_model.rssm.sample(prior_mean, prior_std) 
+        value = self.critic(memory, latent)
+        values.append(value)
+        
         values = torch.stack(values, dim=1)
         
         return memories, latents, actions, rewards, values
@@ -382,13 +342,13 @@ class Agent:
         for param in self.world_model.parameters():
             param.requires_grad = False
             
-        memories, latents, actions, rewards, values = self.imagine_rollout(initial_memory, initial_latent, horizon)
+        memories, latents, actions, rewards, values = self.imagine(initial_memory, initial_latent, horizon)
         returns = self.compute_return(rewards, values)
         
-        critic_loss = F.mse_loss(values, returns.detach())
+        critic_loss = F.mse_loss(values[:, :-1, :], returns.detach())
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
         
         for param in self.actor.parameters():
@@ -406,13 +366,13 @@ class Agent:
         for param in self.world_model.parameters():
             param.requires_grad = False
             
-        memories, latents, actions, rewards, values = self.imagine_rollout(initial_memory, initial_latent, horizon)
+        memories, latents, actions, rewards, values = self.imagine(initial_memory, initial_latent, horizon)
         returns = self.compute_return(rewards, values)
         
         actor_loss = -returns.mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
         
         for param in self.critic.parameters():
@@ -489,7 +449,7 @@ if __name__ == "__main__":
     buffer = ReplayBuffer()    
     writer = SummaryWriter(log_dir=BASE_DIR)
     
-    test_interval = 1000
+    test_interval = 5000000
     
     episode_states = {}
     episode_actions = {}
@@ -541,7 +501,7 @@ if __name__ == "__main__":
             else:
                 continue
             
-            episode_states[agent_id].append(states_tensor[i].numpy())    
+            episode_states[agent_id].append(next_obs)  
             episode_actions[agent_id].append(actions[i])
             episode_rewards[agent_id].append(reward)
             
@@ -614,6 +574,69 @@ if __name__ == "__main__":
             if update_count % test_interval == 0:
                 print(f"Update Count {update_count}")
                 test_env.reset()
+                t_decision_steps, _ = test_env.get_steps(t_behavior_name)
+                
+                test_memories = {}
+                test_latents = {}
+                test_total_reward = 0.0
+
+                for agent_id in t_decision_steps.agent_id:
+                    test_memories[agent_id] = torch.zeros(1, 256)
+                    test_latents[agent_id] = torch.zeros(1, 32)
+                    
+                while True:
+                    t_agent_ids = t_decision_steps.agent_id
+                    if len(t_agent_ids) == 0:
+                        print(f"[TEST] Total Reward: {test_total_reward:.3f}")
+                        break
+                    if len(t_agent_ids) > 0:
+                        t_states_tensor = torch.from_numpy(t_decision_steps.obs[0]).to(torch.float32)   
+                        t_actions = []
+                        with torch.no_grad():
+                            for i, agent_id in enumerate(t_agent_ids):
+                                memory = test_memories[agent_id]
+                                latent = test_latents[agent_id]
+                                t_action = agent.actor.deterministic(memory, latent)
+                                t_actions.append(t_action.squeeze(0))
+                                
+                        t_actions = torch.stack(t_actions)                     
+                        t_actions_np = t_actions.cpu().numpy().astype(np.float32)
+                        test_env.set_actions(t_behavior_name, ActionTuple(continuous=t_actions_np))
+                        
+                    test_env.step()
+                    t_next_decision_steps, t_terminal_steps = test_env.get_steps(t_behavior_name)
+                    
+                    for i, agent_id in enumerate(t_agent_ids):
+                        if agent_id in t_next_decision_steps:
+                            reward = t_next_decision_steps[agent_id].reward
+                            done = False
+                            next_obs = t_next_decision_steps[agent_id].obs[0]
+                        elif agent_id in t_terminal_steps:
+                            reward = t_terminal_steps[agent_id].reward
+                            done = True
+                            next_obs = t_terminal_steps[agent_id].obs[0]
+                        else:
+                            continue
+                            
+                        test_total_reward += reward
+                        
+                        with torch.no_grad():
+                            old_memory = test_memories[agent_id]
+                            old_latent = test_latents[agent_id]
+                        
+                            t_action = t_actions[i].unsqueeze(0)
+                            new_memory = agent.world_model.rssm.gru(old_latent, t_action, old_memory)
+                            next_state = torch.from_numpy(next_obs).float().unsqueeze(0)
+                            next_embed = agent.world_model.encoder(next_state)
+                            
+                            posterior_mean, posterior_std = agent.world_model.rssm.posterior(new_memory, next_embed)                            
+                            next_latent = posterior_mean
+                            
+                            test_memories[agent_id] = new_memory
+                            test_latents[agent_id] = next_latent
+                            
+                    t_decision_steps = t_next_decision_steps
+                            
         
         
         
