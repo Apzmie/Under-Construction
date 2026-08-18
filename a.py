@@ -449,11 +449,12 @@ if __name__ == "__main__":
     buffer = ReplayBuffer()    
     writer = SummaryWriter(log_dir=BASE_DIR)
     
-    test_interval = 5000000
+    test_interval = 50
     
     episode_states = {}
     episode_actions = {}
     episode_rewards = {}
+    episode_steps = {}
     memories = {}
     latents = {}
     
@@ -470,6 +471,7 @@ if __name__ == "__main__":
                 episode_states[agent_id] = []
                 episode_actions[agent_id] = []
                 episode_rewards[agent_id] = []
+                episode_steps[agent_id] = 0
         
         if len(agent_ids) > 0:
             states_tensor = torch.from_numpy(decision_steps.obs[0]).to(torch.float32)
@@ -483,8 +485,8 @@ if __name__ == "__main__":
                     )
                     actions.append(action.squeeze(0))
             actions = torch.stack(actions)
-            actions = actions.cpu().numpy().astype(np.float32)
-            env.set_actions(behavior_name, ActionTuple(continuous=actions))
+            actions_np = actions.cpu().numpy().astype(np.float32)
+            env.set_actions(behavior_name, ActionTuple(continuous=actions_np))
             
         env.step()
         next_decision_steps, terminal_steps = env.get_steps(behavior_name)
@@ -500,15 +502,19 @@ if __name__ == "__main__":
                 next_obs = terminal_steps[agent_id].obs[0]
             else:
                 continue
+                
+            episode_steps[agent_id] += 1
+            if episode_steps[agent_id] >= 500:
+                done = True
             
             episode_states[agent_id].append(next_obs)  
-            episode_actions[agent_id].append(actions[i])
+            episode_actions[agent_id].append(actions[i].detach().cpu().numpy())
             episode_rewards[agent_id].append(reward)
             
             with torch.no_grad():
                 old_memory = memories[agent_id].unsqueeze(0)
                 old_latent = latents[agent_id].unsqueeze(0)
-                action = torch.from_numpy(actions[i]).float().unsqueeze(0)
+                action = actions[i].float().unsqueeze(0)
                 
                 new_memory = agent.world_model.rssm.gru(old_latent, action, old_memory)
                 next_state = torch.from_numpy(next_obs).float().unsqueeze(0)
@@ -527,50 +533,54 @@ if __name__ == "__main__":
                     episode_rewards[agent_id]
                 )
                 
-                print(
-                    "Episode finished:",
-                    len(episode_states[agent_id]),
-                    "steps | reward:",
-                    sum(episode_rewards[agent_id]),
-                    "| buffer:",
-                    len(buffer.episodes)
-                )
+                max_length = max(len(ep["states"]) for ep in buffer.episodes)
+                if max_length >= 50:
+                    buffer.sequence_length = 50
+                elif max_length >= 20:
+                    buffer.sequence_length = 20
+                else:
+                    buffer.sequence_length = 5
+                
+                print("Episode finished:", len(episode_states[agent_id]))
                 
                 del episode_states[agent_id]
                 del episode_actions[agent_id]
                 del episode_rewards[agent_id]
                 del memories[agent_id]
                 del latents[agent_id]
+                del episode_steps[agent_id]
         
-        if len(buffer.episodes) >= 50:
-            batch = buffer.sample()
+                if len(buffer.episodes) >= 50:
+                    for _ in range(10):
+                        batch = buffer.sample()
             
-            states = batch["states"]
-            actions = batch["actions"]
-            rewards = batch["rewards"]  
+                        batch_states = batch["states"]
+                        batch_actions = batch["actions"]
+                        batch_rewards = batch["rewards"]  
             
-            B = states.shape[0]
+                        B = batch_states.shape[0]
             
-            initial_memory = torch.zeros(B, 256)
-            initial_latent = torch.zeros(B, 32)       
+                        initial_memory = torch.zeros(B, 256)
+                        initial_latent = torch.zeros(B, 32)       
 
-            losses = agent.update_world_model(states, actions, rewards, initial_memory, initial_latent)
-            update_count += 1
+                        losses = agent.update_world_model(batch_states, batch_actions, batch_rewards, initial_memory, initial_latent)
             
-            writer.add_scalar("Train/WorldModel_total_loss", losses["total_loss"].item(), update_count)
-            writer.add_scalar("Train/WorldModel_reconstruction_loss", losses["reconstruction_loss"].item(), update_count)
-            writer.add_scalar("Train/WorldModel_reward_loss", losses["reward_loss"].item(), update_count)
-            writer.add_scalar("Train/WorldModel_distribution_loss", losses["distribution_loss"].item(), update_count)
+                        writer.add_scalar("Train/WorldModel_total_loss", losses["total_loss"].item(), update_count)
+                        writer.add_scalar("Train/WorldModel_reconstruction_loss", losses["reconstruction_loss"].item(), update_count)
+                        writer.add_scalar("Train/WorldModel_reward_loss", losses["reward_loss"].item(), update_count)
+                        writer.add_scalar("Train/WorldModel_distribution_loss", losses["distribution_loss"].item(), update_count)
             
-            imagination_memory = losses["memories"][:, -1, :]
-            imagination_latent = losses["latents"][:, -1, :]        
+                        imagination_memory = losses["memories"][:, -1, :]
+                        imagination_latent = losses["latents"][:, -1, :]        
 
-            critic_loss = agent.update_critic(imagination_memory.detach(), imagination_latent.detach())
-            writer.add_scalar("Train/Critic_loss", critic_loss.item(), update_count)
+                        critic_loss = agent.update_critic(imagination_memory.detach(), imagination_latent.detach())
+                        writer.add_scalar("Train/Critic_loss", critic_loss.item(), update_count)
             
-            actor_loss = agent.update_actor(imagination_memory.detach(), imagination_latent.detach())
-            writer.add_scalar("Train/Actor_loss", actor_loss.item(), update_count)      
-        
+                        actor_loss = agent.update_actor(imagination_memory.detach(), imagination_latent.detach())
+                        writer.add_scalar("Train/Actor_loss", actor_loss.item(), update_count)      
+                    
+                    update_count += 1
+                    
             if update_count % test_interval == 0:
                 print(f"Update Count {update_count}")
                 test_env.reset()
