@@ -385,11 +385,11 @@ class Agent:
 
 
 class ReplayBuffer:
-    def __init__(self, max_episodes=1000, batch_size=256, sequence_length=10):
+    def __init__(self, max_episodes=1000, batch_size=256, sequence_length=5):
         self.max_episodes = max_episodes
         self.batch_size = batch_size
         self.sequence_length = sequence_length
-        self.episodes = []
+        self.episodes = []      
 
     def add_episode(self, states, actions, rewards):
         if len(self.episodes) >= self.max_episodes:
@@ -449,7 +449,12 @@ if __name__ == "__main__":
     buffer = ReplayBuffer()    
     writer = SummaryWriter(log_dir=BASE_DIR)
     
-    test_interval = 50
+    memory_dim, latent_dim = 256, 32
+    max_episode_steps = 500
+    min_buffer_size = 50
+    updates_per_episode = 10
+    test_interval = 10
+    test_max_step = 500
     
     episode_states = {}
     episode_actions = {}
@@ -458,7 +463,10 @@ if __name__ == "__main__":
     memories = {}
     latents = {}
     
-    update_count = 0
+    update_iteration = 0
+    last_test_iteration = -1
+    save_idx = 0
+    best_test_reward = -float('inf')
     
     while True:
         decision_steps, terminal_steps = env.get_steps(behavior_name)   
@@ -466,8 +474,8 @@ if __name__ == "__main__":
         
         for i, agent_id in enumerate(agent_ids):
             if agent_id not in memories:
-                memories[agent_id] = torch.zeros(256)
-                latents[agent_id] = torch.zeros(32)
+                memories[agent_id] = torch.zeros(memory_dim)
+                latents[agent_id] = torch.zeros(latent_dim)
                 episode_states[agent_id] = []
                 episode_actions[agent_id] = []
                 episode_rewards[agent_id] = []
@@ -504,7 +512,7 @@ if __name__ == "__main__":
                 continue
                 
             episode_steps[agent_id] += 1
-            if episode_steps[agent_id] >= 500:
+            if episode_steps[agent_id] >= max_episode_steps:
                 done = True
             
             episode_states[agent_id].append(next_obs)  
@@ -533,6 +541,8 @@ if __name__ == "__main__":
                     episode_rewards[agent_id]
                 )
                 
+                print("episode_length:", len(episode_rewards[agent_id]))
+                
                 max_length = max(len(ep["states"]) for ep in buffer.episodes)
                 if max_length >= 50:
                     buffer.sequence_length = 50
@@ -541,8 +551,6 @@ if __name__ == "__main__":
                 else:
                     buffer.sequence_length = 5
                 
-                print("Episode finished:", len(episode_states[agent_id]))
-                
                 del episode_states[agent_id]
                 del episode_actions[agent_id]
                 del episode_rewards[agent_id]
@@ -550,109 +558,135 @@ if __name__ == "__main__":
                 del latents[agent_id]
                 del episode_steps[agent_id]
         
-                if len(buffer.episodes) >= 50:
-                    for _ in range(10):
+                if len(buffer.episodes) >= min_buffer_size:
+                    for _ in range(updates_per_episode):
                         batch = buffer.sample()
             
                         batch_states = batch["states"]
                         batch_actions = batch["actions"]
                         batch_rewards = batch["rewards"]  
             
-                        B = batch_states.shape[0]
-            
-                        initial_memory = torch.zeros(B, 256)
-                        initial_latent = torch.zeros(B, 32)       
+                        B = batch_states.shape[0]        
+                        initial_memory = torch.zeros(B, memory_dim)
+                        initial_latent = torch.zeros(B, latent_dim)       
 
                         losses = agent.update_world_model(batch_states, batch_actions, batch_rewards, initial_memory, initial_latent)
             
-                        writer.add_scalar("Train/WorldModel_total_loss", losses["total_loss"].item(), update_count)
-                        writer.add_scalar("Train/WorldModel_reconstruction_loss", losses["reconstruction_loss"].item(), update_count)
-                        writer.add_scalar("Train/WorldModel_reward_loss", losses["reward_loss"].item(), update_count)
-                        writer.add_scalar("Train/WorldModel_distribution_loss", losses["distribution_loss"].item(), update_count)
+                        writer.add_scalar("Train/WorldModel_total_loss", losses["total_loss"].item(), update_iteration)
+                        writer.add_scalar("Train/WorldModel_reconstruction_loss", losses["reconstruction_loss"].item(), update_iteration)
+                        writer.add_scalar("Train/WorldModel_reward_loss", losses["reward_loss"].item(), update_iteration)
+                        writer.add_scalar("Train/WorldModel_distribution_loss", losses["distribution_loss"].item(), update_iteration)
             
                         imagination_memory = losses["memories"][:, -1, :]
                         imagination_latent = losses["latents"][:, -1, :]        
 
                         critic_loss = agent.update_critic(imagination_memory.detach(), imagination_latent.detach())
-                        writer.add_scalar("Train/Critic_loss", critic_loss.item(), update_count)
+                        writer.add_scalar("Train/Critic_loss", critic_loss.item(), update_iteration)
             
                         actor_loss = agent.update_actor(imagination_memory.detach(), imagination_latent.detach())
-                        writer.add_scalar("Train/Actor_loss", actor_loss.item(), update_count)      
+                        writer.add_scalar("Train/Actor_loss", actor_loss.item(), update_iteration)      
                     
-                    update_count += 1
+                    update_iteration += 1
                     
-            if update_count % test_interval == 0:
-                print(f"Update Count {update_count}")
-                test_env.reset()
-                t_decision_steps, _ = test_env.get_steps(t_behavior_name)
+        if update_iteration > 0 and update_iteration % test_interval == 0 and update_iteration != last_test_iteration:
+            last_test_iteration = update_iteration
+            print(f"update_iteration {update_iteration}")
+            test_env.reset()
+            t_decision_steps, _ = test_env.get_steps(t_behavior_name)
                 
-                test_memories = {}
-                test_latents = {}
-                test_total_reward = 0.0
+            n_test_agents = len(t_decision_steps.agent_id)
+            test_rewards = np.zeros(n_test_agents)
+            test_episode_dones = np.zeros(n_test_agents, dtype=bool)
+            test_id_to_index = {agent_id: i for i, agent_id in enumerate(t_decision_steps.agent_id)}                 
+                
+            test_memories = {}
+            test_latents = {}
+            test_total_reward = 0.0
 
-                for agent_id in t_decision_steps.agent_id:
-                    test_memories[agent_id] = torch.zeros(1, 256)
-                    test_latents[agent_id] = torch.zeros(1, 32)
-                    
-                while True:
-                    t_agent_ids = t_decision_steps.agent_id
-                    if len(t_agent_ids) == 0:
-                        print(f"[TEST] Total Reward: {test_total_reward:.3f}")
-                        break
-                    if len(t_agent_ids) > 0:
-                        t_states_tensor = torch.from_numpy(t_decision_steps.obs[0]).to(torch.float32)   
-                        t_actions = []
-                        with torch.no_grad():
-                            for i, agent_id in enumerate(t_agent_ids):
-                                memory = test_memories[agent_id]
-                                latent = test_latents[agent_id]
-                                t_action = agent.actor.deterministic(memory, latent)
-                                t_actions.append(t_action.squeeze(0))
+            for agent_id in t_decision_steps.agent_id:
+                test_memories[agent_id] = torch.zeros(1, memory_dim)
+                test_latents[agent_id] = torch.zeros(1, latent_dim)
+                
+            test_max_step_count = 0    
+            while not np.all(test_episode_dones) and test_max_step_count < test_max_step:
+                t_decision_steps, _ = test_env.get_steps(t_behavior_name)
+                t_agent_ids = t_decision_steps.agent_id
+                if len(t_agent_ids) > 0:
+                    t_states_tensor = torch.from_numpy(t_decision_steps.obs[0]).to(torch.float32)   
+                    t_actions = []
+                    with torch.no_grad():
+                        for i, agent_id in enumerate(t_agent_ids):
+                            memory = test_memories[agent_id]
+                            latent = test_latents[agent_id]
+                            t_action = agent.actor.deterministic(memory, latent)
+                            t_actions.append(t_action.squeeze(0))
                                 
-                        t_actions = torch.stack(t_actions)                     
-                        t_actions_np = t_actions.cpu().numpy().astype(np.float32)
-                        test_env.set_actions(t_behavior_name, ActionTuple(continuous=t_actions_np))
+                    t_actions = torch.stack(t_actions)                     
+                    t_actions_np = t_actions.cpu().numpy().astype(np.float32)
+                    test_env.set_actions(t_behavior_name, ActionTuple(continuous=t_actions_np))
                         
-                    test_env.step()
-                    t_next_decision_steps, t_terminal_steps = test_env.get_steps(t_behavior_name)
+                test_env.step()
+                test_max_step_count += 1
+                t_next_decision_steps, t_terminal_steps = test_env.get_steps(t_behavior_name)
                     
-                    for i, agent_id in enumerate(t_agent_ids):
-                        if agent_id in t_next_decision_steps:
-                            reward = t_next_decision_steps[agent_id].reward
-                            done = False
-                            next_obs = t_next_decision_steps[agent_id].obs[0]
-                        elif agent_id in t_terminal_steps:
-                            reward = t_terminal_steps[agent_id].reward
-                            done = True
-                            next_obs = t_terminal_steps[agent_id].obs[0]
-                        else:
-                            continue
+                for i, agent_id in enumerate(t_agent_ids):
+                    if agent_id in t_next_decision_steps:
+                        reward = t_next_decision_steps[agent_id].reward
+                        done = False
+                        next_obs = t_next_decision_steps[agent_id].obs[0]
+                    elif agent_id in t_terminal_steps:
+                        reward = t_terminal_steps[agent_id].reward
+                        done = True
+                        next_obs = t_terminal_steps[agent_id].obs[0]
                             
-                        test_total_reward += reward
+                        idx = test_id_to_index[agent_id]
+                        test_episode_dones[idx] = True
+                    else:
+                        continue
+                            
+                    idx = test_id_to_index[agent_id]
+                    test_rewards[idx] += reward                           
                         
-                        with torch.no_grad():
-                            old_memory = test_memories[agent_id]
-                            old_latent = test_latents[agent_id]
+                    with torch.no_grad():
+                        old_memory = test_memories[agent_id]
+                        old_latent = test_latents[agent_id]
                         
-                            t_action = t_actions[i].unsqueeze(0)
-                            new_memory = agent.world_model.rssm.gru(old_latent, t_action, old_memory)
-                            next_state = torch.from_numpy(next_obs).float().unsqueeze(0)
-                            next_embed = agent.world_model.encoder(next_state)
+                        t_action = t_actions[i].unsqueeze(0)
+                        new_memory = agent.world_model.rssm.gru(old_latent, t_action, old_memory)
+                        next_state = torch.from_numpy(next_obs).float().unsqueeze(0)
+                        next_embed = agent.world_model.encoder(next_state)
                             
-                            posterior_mean, posterior_std = agent.world_model.rssm.posterior(new_memory, next_embed)                            
-                            next_latent = posterior_mean
-                            
-                            test_memories[agent_id] = new_memory
-                            test_latents[agent_id] = next_latent
-                            
-                    t_decision_steps = t_next_decision_steps
-                            
-        
-        
-        
-        
-        
-        
-        
-        
+                        posterior_mean, posterior_std = agent.world_model.rssm.posterior(new_memory, next_embed)                            
+                        next_latent = posterior_mean
+                           
+                        test_memories[agent_id] = new_memory
+                        test_latents[agent_id] = next_latent
+
+            test_average_reward = np.mean(test_rewards)  
+            writer.add_scalar("Test/Average_Reward", test_average_reward, update_iteration)
+            print(f"{test_average_reward:.4f}")
+            torch.save({
+                "world_model": agent.world_model.state_dict(),
+                "actor": agent.actor.state_dict(),
+                "critic": agent.critic.state_dict(),
+                "world_model_optimizer": agent.world_model_optimizer.state_dict(),
+                "actor_optimizer": agent.actor_optimizer.state_dict(),
+                "critic_optimizer": agent.critic_optimizer.state_dict(),
+            }, f"{BASE_DIR}/checkpoint.pth")
+               
+            torch.save({
+                "encoder": agent.world_model.encoder.state_dict(),
+                "rssm": agent.world_model.rssm.state_dict(),
+                "actor": agent.actor.state_dict(),
+            }, f"{BASE_DIR}/period_model.pth")
+                        
+            if test_average_reward > best_test_reward:
+                best_test_reward = test_average_reward
+                save_idx += 1
+                torch.save({
+                    "encoder": agent.world_model.encoder.state_dict(),
+                    "rssm": agent.world_model.rssm.state_dict(),
+                    "actor": agent.actor.state_dict(),
+                }, f"{BASE_DIR}/#({save_idx})best_{best_test_reward:.4f}.pth")
+                print(f"[Test] Model saved at new best reward {best_test_reward:.4f}")                           
         
