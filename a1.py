@@ -173,24 +173,106 @@ class Agent(nn.Module):
         self.world_model = WorldModel(state_dim, action_dim)
         self.actor = Actor(action_dim)
         self.critic = Critic()
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
 
-    def i(self, latent, action, memory):
+
+    def imagine_with_AC(self, memory, latent):
+        action = self.actor(memory, latent)
         memory, prior_latent = self.world_model.rssm.imagine(latent, action, memory)
 
-        action = self.actor(memory, prior_latent)
-        value = self.critic(memory, prior_latent)
-        reward = self.world_model.reward_model(memory, prior_latent)
+        pred_value = self.critic(memory, prior_latent)
+        pred_reward = self.world_model.reward_model(memory, prior_latent)
+        
+        return pred_value, pred_reward
 
+    def actor_loss(self, pred_reward):
+        actor_loss = -pred_reward
+        return actor_loss
+        
+    def critic_loss(self, value, pred_value):
+        critic_loss = F.mse_loss(value, pred_value)
+        return critic_loss
     
+    def update(self, memory, latent, value):
+        for param in self.world_model.parameters():
+            param.requires_grad = False
+        
+        pred_value, pred_reward = self.imagine_with_AC(memory, latent)     
+        
+        actor_loss = self.actor_loss(pred_reward)
+        critic_loss = self.critic_loss(value, pred_value)
+        
+        loss = actor_loss + critic_loss
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        for param in self.world_model.parameters():
+            param.requires_grad = True
+            
+        return loss
+        
+        
+if __name__ == "__main__":
+    channel1 = EngineConfigurationChannel()
+    channel1.set_configuration_parameters(time_scale=20.0)
+    env = UnityEnvironment(file_name=f"{BASE_DIR}/Build.x86_64", side_channels=[channel1], no_graphics=True, worker_id=0)
+    env.reset()
+    
+    behavior_name = list(env.behavior_specs.keys())[0]
+    spec = env.behavior_specs[behavior_name]
+    state_dim = spec.observation_specs[0].shape[0]
+    action_dim = spec.action_spec.continuous_size
+    agent = Agent(state_dim, action_dim)
+    writer = SummaryWriter(log_dir=BASE_DIR)        
+    
+    memory_dim, latent_dim = 256, 64
+    step = 0
+    episode_start = True
+        
+    while True:
+        decision_steps, terminal_steps = env.get_steps(behavior_name)
+
+        if episode_start:
+            num_agents = len(decision_steps.agent_id)
+            memory = torch.zeros(num_agents, memory_dim)
+            latent = torch.zeros(num_agents, latent_dim)
+            episode_start = False  
+          
+        agent_ids = decision_steps.agent_id
+        if len(agent_ids) > 0:
+            states_tensor = torch.from_numpy(decision_steps.obs[0]).to(torch.float32)
+            with torch.no_grad():
+                action = agent.actor(memory, latent)
+            actions_np = action.cpu().numpy().astype(np.float32)
+            env.set_actions(behavior_name, ActionTuple(continuous=actions_np))
+        
+        env.step()
+        step += 1
+        next_decision_steps, terminal_steps = env.get_steps(behavior_name)
+        
+        for i, agent_id in enumerate(agent_ids):
+            if agent_id in next_decision_steps:
+                reward = next_decision_steps[agent_id].reward
+                next_obs = next_decision_steps[agent_id].obs[0]
+                done = False
+            elif agent_id in terminal_steps:
+                reward = terminal_steps[agent_id].reward
+                next_obs = terminal_steps[agent_id].obs[0]
+                done = True
+            else:
+                continue
+        
+        if step % 1000 == 0:
+            print(step)
+        
+        embed = agent.world_model.encoder(states_tensor)
+        memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, embed)
         
         
         
-        
-        
-        
-        
-        
-        
+        action = 0
         
         
         
