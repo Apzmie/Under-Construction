@@ -48,7 +48,7 @@ class RSSM(nn.Module):
         prior_dist = torch.distributions.Normal(prior_mean, prior_std)
         prior_latent = prior_dist.rsample()
         
-        return posterior_latent, prior_latent, memory, posterior_dist, prior_dist
+        return memory, posterior_dist, posterior_latent, prior_dist, prior_latent
         
     def imagine(self, latent, action, memory):
         gru_input = torch.cat([latent, action], dim=-1)
@@ -56,10 +56,10 @@ class RSSM(nn.Module):
         
         prior_mean = self.prior_mean(memory)
         prior_std = F.softplus(self.prior_std(memory)) + 1e-4
-        distribution = torch.distributions.Normal(prior_mean, prior_std)
-        latent = distribution.rsample()
+        prior_dist = torch.distributions.Normal(prior_mean, prior_std)
+        prior_latent = prior_dist.rsample()
         
-        return latent, memory
+        return memory, prior_latent
 
         
 class Decoder(nn.Module):
@@ -118,7 +118,7 @@ class WorldModel(nn.Module):
         
     def update(self, state, latent, action, memory, reward):
         embed = self.encoder(state)
-        posterior_latent, prior_latent, memory, posterior_dist, prior_dist = self.rssm.observe(latent, action, memory, embed)
+        memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, action, memory, embed)
         
         recon_loss = self.recon_loss(memory, posterior_latent, state)
         reward_loss = self.reward_loss(memory, posterior_latent, reward)
@@ -165,10 +165,23 @@ class Critic(nn.Module):
         x = F.elu(self.fc2(x))
         value = self.value(x)
         return value
-        
-        
-        
-        
+
+
+class Agent(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.world_model = WorldModel(state_dim, action_dim)
+        self.actor = Actor(action_dim)
+        self.critic = Critic()
+
+    def i(self, latent, action, memory):
+        memory, prior_latent = self.world_model.rssm.imagine(latent, action, memory)
+
+        action = self.actor(memory, prior_latent)
+        value = self.critic(memory, prior_latent)
+        reward = self.world_model.reward_model(memory, prior_latent)
+
+    
         
         
         
