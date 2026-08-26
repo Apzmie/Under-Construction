@@ -228,25 +228,44 @@ if __name__ == "__main__":
     writer = SummaryWriter(log_dir=BASE_DIR)        
     
     memory_dim, latent_dim = 256, 64
-    step = 0
-    episode_start = True
+    step = 0    
+    agent_dictionary = {}
         
     while True:
         decision_steps, terminal_steps = env.get_steps(behavior_name)
-
-        if episode_start:
-            num_agents = len(decision_steps.agent_id)
-            memory = torch.zeros(num_agents, memory_dim)
-            latent = torch.zeros(num_agents, latent_dim)
-            episode_start = False  
-          
         agent_ids = decision_steps.agent_id
         if len(agent_ids) > 0:
             states_tensor = torch.from_numpy(decision_steps.obs[0]).to(torch.float32)
-            with torch.no_grad():
-                action = agent.actor(memory, latent)
-            actions_np = action.cpu().numpy().astype(np.float32)
-            env.set_actions(behavior_name, ActionTuple(continuous=actions_np))
+            num_agents = len(agent_ids)
+            
+            actions_for_unity= []
+            for i, agent_id in enumerate(agent_ids):
+                if agent_id not in agent_dictionary:
+                    memory = torch.zeros(1, memory_dim)
+                    latent = torch.zeros(1, latent_dim)
+                    action = torch.zeros(1, action_dim)
+            
+                    state = states_tensor[i].unsqueeze(0)
+                    embed = agent.world_model.encoder(state)
+                    memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, embed)                
+            
+                    agent_dictionary[agent_id] = {
+                        "memory": memory.squeeze(0),
+                        "latent": latent.squeeze(0),
+                        "action": action.squeeze(0),
+                    }
+                    
+                memory = agent_dictionary[agent_id]["memory"].unsqueeze(0)
+                latent = agent_dictionary[agent_id]["latent"].unsqueeze(0)
+                
+                with torch.no_grad():
+                    action = agent.actor(memory, latent)
+                action = action.squeeze(0)                
+                agent_dictionary[agent_id]["action"] = action
+                actions_for_unity.append(action.numpy())
+                
+            actions_for_unity = np.array(actions_for_unity)
+            env.set_actions(behavior_name, ActionTuple(continuous=actions_for_unity))
         
         env.step()
         step += 1
@@ -263,16 +282,24 @@ if __name__ == "__main__":
                 done = True
             else:
                 continue
-        
-        if step % 1000 == 0:
+            
+            next_state = torch.from_numpy(next_obs).float().unsqueeze(0)
+            next_embed = agent.world_model.encoder(next_state)
+            
+            action = agent_dictionary[agent_id]["action"].unsqueeze(0)
+            memory = agent_dictionary[agent_id]["memory"].unsqueeze(0)
+            latent = agent_dictionary[agent_id]["latent"].unsqueeze(0)
+            memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, next_embed)                
+            
+            agent_dictionary[agent_id]["memory"] = memory.squeeze(0)
+            agent_dictionary[agent_id]["latent"] = latent.squeeze(0)
+            
+            if done:
+                del agent_dictionary[agent_id]
+            
+        if step % 100 == 0:
             print(step)
-        
-        embed = agent.world_model.encoder(states_tensor)
-        memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, embed)
-        
-        
-        
-        action = 0
+
         
         
         
