@@ -213,6 +213,45 @@ class Agent(nn.Module):
             
         return loss
         
+
+class ReplayBuffer:
+    def __init__(self, capacity=1000, sequence_length=50):
+        self.episodes = []
+        self.capacity = capacity
+        self.sequence_length = sequence_length
+        
+    def add_episode(self, episode):
+        if len(self.episodes) >= self.capacity:
+            self.episodes.pop(0)            
+        self.episodes.append(episode)
+        
+    def sample(self):
+        if len(self.episodes) == 0:
+            return None
+            
+        episode = self.episodes[np.random.randint(len(self.episodes))]        
+        if len(episode) > self.sequence_length:
+            start = np.random.randint(len(episode) - self.sequence_length + 1)
+            episode = episode[start:start + self.sequence_length]
+        
+        states = []
+        actions = []
+        rewards = []
+        next_states = []
+        dones = []
+        
+        for transition in episode:
+            states.append(transition["state"])
+            actions.append(transition["action"])
+            rewards.append(transition["reward"])
+            next_states.append(transition["next_state"])
+            dones.append(transition["done"])
+        
+        return states, actions, rewards, next_states, dones
+        
+    def __len__(self):
+        return len(self.episodes)
+        
         
 if __name__ == "__main__":
     channel1 = EngineConfigurationChannel()
@@ -225,6 +264,7 @@ if __name__ == "__main__":
     state_dim = spec.observation_specs[0].shape[0]
     action_dim = spec.action_spec.continuous_size
     agent = Agent(state_dim, action_dim)
+    buffer = ReplayBuffer()
     writer = SummaryWriter(log_dir=BASE_DIR)        
     
     memory_dim, latent_dim = 256, 64
@@ -238,7 +278,7 @@ if __name__ == "__main__":
             states_tensor = torch.from_numpy(decision_steps.obs[0]).to(torch.float32)
             num_agents = len(agent_ids)
             
-            actions_for_unity= []
+            actions_for_unity = []
             for i, agent_id in enumerate(agent_ids):
                 if agent_id not in agent_dictionary:
                     memory = torch.zeros(1, memory_dim)
@@ -253,6 +293,7 @@ if __name__ == "__main__":
                         "memory": memory.squeeze(0),
                         "latent": latent.squeeze(0),
                         "action": action.squeeze(0),
+                        "transitions": []
                     }
                     
                 memory = agent_dictionary[agent_id]["memory"].unsqueeze(0)
@@ -283,22 +324,36 @@ if __name__ == "__main__":
             else:
                 continue
             
+            agent_dictionary[agent_id]["transitions"].append({
+                "state": states_tensor[i],
+                "action": agent_dictionary[agent_id]["action"],
+                "reward": reward,
+                "next_state": torch.from_numpy(next_obs).float(),
+                "done": done
+            })
+            
             next_state = torch.from_numpy(next_obs).float().unsqueeze(0)
             next_embed = agent.world_model.encoder(next_state)
             
             action = agent_dictionary[agent_id]["action"].unsqueeze(0)
             memory = agent_dictionary[agent_id]["memory"].unsqueeze(0)
             latent = agent_dictionary[agent_id]["latent"].unsqueeze(0)
+            
             memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, next_embed)                
             
             agent_dictionary[agent_id]["memory"] = memory.squeeze(0)
             agent_dictionary[agent_id]["latent"] = latent.squeeze(0)
             
             if done:
-                del agent_dictionary[agent_id]
+                episode = agent_dictionary[agent_id]["transitions"]
+                buffer.add_episode(episode)
+                del agent_dictionary[agent_id]           
+            
+        states, actions, rewards, next_states, dones = buffer.sample() 
             
         if step % 100 == 0:
             print(step)
+             
 
         
         
