@@ -114,7 +114,7 @@ class WorldModel(nn.Module):
         
     def dist_loss(self, posterior_dist, prior_dist):
         dist_loss = torch.distributions.kl_divergence(posterior_dist, prior_dist).mean()
-        return dist_loss
+        return dist_loss  
         
     def update(self, state, latent, action, memory, reward):
         embed = self.encoder(state)
@@ -176,7 +176,6 @@ class Agent(nn.Module):
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
 
-
     def imagine_with_AC(self, memory, latent):
         action = self.actor(memory, latent)
         memory, prior_latent = self.world_model.rssm.imagine(latent, action, memory)
@@ -226,9 +225,6 @@ class ReplayBuffer:
         self.episodes.append(episode)
         
     def sample(self):
-        if len(self.episodes) == 0:
-            return None
-            
         episode = self.episodes[np.random.randint(len(self.episodes))]        
         if len(episode) > self.sequence_length:
             start = np.random.randint(len(episode) - self.sequence_length + 1)
@@ -327,7 +323,7 @@ if __name__ == "__main__":
             agent_dictionary[agent_id]["transitions"].append({
                 "state": states_tensor[i],
                 "action": agent_dictionary[agent_id]["action"],
-                "reward": reward,
+                "reward": torch.tensor(reward, dtype=torch.float32),
                 "next_state": torch.from_numpy(next_obs).float(),
                 "done": done
             })
@@ -348,8 +344,21 @@ if __name__ == "__main__":
                 episode = agent_dictionary[agent_id]["transitions"]
                 buffer.add_episode(episode)
                 del agent_dictionary[agent_id]           
+        
+        if len(buffer) > 0:    
+            states, actions, rewards, next_states, dones = buffer.sample()             
+            memory = torch.zeros(1, memory_dim)
+            latent = torch.zeros(1, latent_dim)
             
-        states, actions, rewards, next_states, dones = buffer.sample() 
+            for t in range(len(states)):
+                state = states[t].unsqueeze(0)
+                action = actions[t].unsqueeze(0)
+                reward = rewards[t].unsqueeze(0).unsqueeze(0)
+
+                loss = agent.world_model.update(state, latent, action, memory, reward)
+        
+        
+        
             
         if step % 100 == 0:
             print(step)
