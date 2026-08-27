@@ -120,50 +120,68 @@ class WorldModel(nn.Module):
         dist_loss = torch.distributions.kl_divergence(posterior_dist, prior_dist).mean()
         return dist_loss  
     
-    def update(self, start, episode, memory, latent, actions, rewards, next_states):
-        with torch.no_grad():
-            initial_memory = torch.zeros(1, self.memory_dim)
-            initial_latent = torch.zeros(1, self.latent_dim)
-            initial_action = torch.zeros(1, self.action_dim)            
-            state = episode[0]["state"].unsqueeze(0)
-            embed = self.encoder(state)
-            memory, _, latent, _, _ = self.rssm.observe(initial_latent, initial_action, initial_memory, embed)
-            
-            for t in range(start):
-                action = episode[t]["action"].unsqueeze(0)  
-                next_state = episode[t]["next_state"].unsqueeze(0)         
-                embed = self.encoder(next_state)
-                memory, _, latent, _, _ = self.rssm.observe(latent, action, memory, embed)        
-        
+    def update(self, batch):
+        batch_size = len(batch)
         total_loss = 0.0
         total_recon_loss = 0.0
         total_reward_loss = 0.0
         total_dist_loss = 0.0
         
-        for t in range(len(next_states)):
-            action = actions[t].unsqueeze(0)
-            reward = rewards[t].unsqueeze(0).unsqueeze(0)
-            next_state = next_states[t].unsqueeze(0)            
-            embed = self.encoder(next_state)
-            memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, action, memory, embed)
+        for sample in batch:
+            episode = sample["episode"]
+            start = sample["start"]
+            actions = sample["actions"]
+            rewards = sample["rewards"]
+            next_states = sample["next_states"]
+        
+            with torch.no_grad():
+                initial_memory = torch.zeros(1, self.memory_dim)
+                initial_latent = torch.zeros(1, self.latent_dim)
+                initial_action = torch.zeros(1, self.action_dim)            
+                state = episode[0]["state"].unsqueeze(0)
+                embed = self.encoder(state)
+                memory, _, latent, _, _ = self.rssm.observe(initial_latent, initial_action, initial_memory, embed)
+            
+                for t in range(start):
+                    action = episode[t]["action"].unsqueeze(0)  
+                    next_state = episode[t]["next_state"].unsqueeze(0)         
+                    embed = self.encoder(next_state)
+                    memory, _, latent, _, _ = self.rssm.observe(latent, action, memory, embed)        
+            
+            sample_loss = 0.0
+            sample_recon_loss = 0.0
+            sample_reward_loss = 0.0
+            sample_dist_loss = 0.0
+            for t in range(len(next_states)):
+                action = actions[t].unsqueeze(0)
+                reward = rewards[t].unsqueeze(0).unsqueeze(0)
+                next_state = next_states[t].unsqueeze(0)            
+                embed = self.encoder(next_state)
+                memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, action, memory, embed)
     
-            recon_loss = self.recon_loss(memory, posterior_latent, next_state)
-            reward_loss = self.reward_loss(memory, posterior_latent, reward)
-            dist_loss = self.dist_loss(posterior_dist, prior_dist)
+                recon_loss = self.recon_loss(memory, posterior_latent, next_state)
+                reward_loss = self.reward_loss(memory, posterior_latent, reward)
+                dist_loss = self.dist_loss(posterior_dist, prior_dist)
             
-            loss = recon_loss + reward_loss + dist_loss 
+                loss = recon_loss + reward_loss + dist_loss 
             
-            total_loss += loss
-            total_recon_loss += recon_loss
-            total_reward_loss += reward_loss
-            total_dist_loss += dist_loss
+                sample_loss += loss
+                sample_recon_loss += recon_loss
+                sample_reward_loss += reward_loss
+                sample_dist_loss += dist_loss
             
-            latent = posterior_latent
+                latent = posterior_latent
             
-        total_recon_loss = total_recon_loss / len(next_states)
-        total_reward_loss = total_reward_loss / len(next_states)
-        total_dist_loss = total_dist_loss / len(next_states)
-        total_loss = total_loss / len(next_states)        
+            total_loss += sample_loss / len(next_states)
+            total_recon_loss += sample_recon_loss / len(next_states)
+            total_reward_loss += sample_reward_loss / len(next_states)
+            total_dist_loss += sample_dist_loss / len(next_states)
+            
+        total_loss = total_loss / batch_size 
+        total_recon_loss = total_recon_loss / batch_size
+        total_reward_loss = total_reward_loss / batch_size
+        total_dist_loss = total_dist_loss / batch_size
+
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
@@ -253,9 +271,10 @@ class Agent(nn.Module):
         
 
 class ReplayBuffer:
-    def __init__(self, capacity=1000, sequence_length=50):
+    def __init__(self, capacity=1000, batch_size=8, sequence_length=50):
         self.episodes = []
         self.capacity = capacity
+        self.batch_size = batch_size
         self.sequence_length = sequence_length
         
     def add_episode(self, episode):
@@ -264,33 +283,41 @@ class ReplayBuffer:
         self.episodes.append(episode)
         
     def sample(self):
-        episode = self.episodes[np.random.randint(len(self.episodes))]        
-        if len(episode) > self.sequence_length:
-            start = np.random.randint(len(episode) - self.sequence_length + 1)
-            sequence = episode[start:start + self.sequence_length]
-        else:
-            start = 0  
-            sequence = episode          
+        batch = []
         
-        states = []
-        actions = []
-        rewards = []
-        next_states = []
-        dones = []
+        for _ in range(self.batch_size):
+            episode = self.episodes[np.random.randint(len(self.episodes))]        
+            if len(episode) > self.sequence_length:
+                start = np.random.randint(len(episode) - self.sequence_length + 1)
+                sequence = episode[start:start + self.sequence_length]
+            else:
+                start = 0  
+                sequence = episode          
         
-        for transition in sequence:
-            states.append(transition["state"])
-            actions.append(transition["action"])
-            rewards.append(transition["reward"])
-            next_states.append(transition["next_state"])
-            dones.append(transition["done"])
+            states = []
+            actions = []
+            rewards = []
+            next_states = []
+            dones = []
         
-        states = torch.stack(states)
-        actions = torch.stack(actions)
-        rewards = torch.stack(rewards)
-        next_states = torch.stack(next_states)  
+            for transition in sequence:
+                states.append(transition["state"])
+                actions.append(transition["action"])
+                rewards.append(transition["reward"])
+                next_states.append(transition["next_state"])
+                dones.append(transition["done"])
+            
+            batch.append({
+                "episode": episode,
+                "start": start,
+                "states": torch.stack(states),
+                "actions": torch.stack(actions),
+                "rewards": torch.stack(rewards),
+                "next_states": torch.stack(next_states),
+                "dones": dones
+            })  
         
-        return states, actions, rewards, next_states, dones, episode, start
+        return batch
         
     def __len__(self):
         return len(self.episodes)
@@ -393,9 +420,9 @@ if __name__ == "__main__":
                 del agent_dictionary[agent_id]           
         
         if len(buffer) > 0:    
-            states, actions, rewards, next_states, dones, episode, start = buffer.sample()             
-            total_loss, recon_loss, reward_loss, dist_loss = agent.world_model.update(start, episode, memory, latent, actions, rewards, next_states)
-            if step % 100 == 0:
+            batch = buffer.sample()             
+            total_loss, recon_loss, reward_loss, dist_loss = agent.world_model.update(batch)
+            if step % 10 == 0:
                 print(
                     step,
                     "total_loss:", total_loss,
