@@ -93,7 +93,7 @@ class RewardModel(nn.Module):
         
 
 class WorldModel(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, memory_dim=256, latent_dim=64):
         super().__init__()
         self.encoder = Encoder(state_dim)
         self.rssm = RSSM(action_dim)
@@ -101,6 +101,10 @@ class WorldModel(nn.Module):
         self.reward_model = RewardModel()
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        
+        self.memory_dim = memory_dim
+        self.latent_dim = latent_dim
+        self.action_dim = action_dim
         
     def recon_loss(self, memory, posterior_latent, state):
         recon = self.decoder(memory, posterior_latent)
@@ -115,21 +119,56 @@ class WorldModel(nn.Module):
     def dist_loss(self, posterior_dist, prior_dist):
         dist_loss = torch.distributions.kl_divergence(posterior_dist, prior_dist).mean()
         return dist_loss  
+    
+    def update(self, start, episode, memory, latent, actions, rewards, next_states):
+        with torch.no_grad():
+            initial_memory = torch.zeros(1, self.memory_dim)
+            initial_latent = torch.zeros(1, self.latent_dim)
+            initial_action = torch.zeros(1, self.action_dim)            
+            state = episode[0]["state"].unsqueeze(0)
+            embed = self.encoder(state)
+            memory, _, latent, _, _ = self.rssm.observe(initial_latent, initial_action, initial_memory, embed)
+            
+            for t in range(start):
+                action = episode[t]["action"].unsqueeze(0)  
+                next_state = episode[t]["next_state"].unsqueeze(0)         
+                embed = self.encoder(next_state)
+                memory, _, latent, _, _ = self.rssm.observe(latent, action, memory, embed)        
         
-    def update(self, state, latent, action, memory, reward):
-        embed = self.encoder(state)
-        memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, action, memory, embed)
+        total_loss = 0.0
+        total_recon_loss = 0.0
+        total_reward_loss = 0.0
+        total_dist_loss = 0.0
         
-        recon_loss = self.recon_loss(memory, posterior_latent, state)
-        reward_loss = self.reward_loss(memory, posterior_latent, reward)
-        dist_loss = self.dist_loss(posterior_dist, prior_dist)
-        
-        loss = recon_loss + reward_loss + dist_loss        
+        for t in range(len(next_states)):
+            action = actions[t].unsqueeze(0)
+            reward = rewards[t].unsqueeze(0).unsqueeze(0)
+            next_state = next_states[t].unsqueeze(0)            
+            embed = self.encoder(next_state)
+            memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, action, memory, embed)
+    
+            recon_loss = self.recon_loss(memory, posterior_latent, next_state)
+            reward_loss = self.reward_loss(memory, posterior_latent, reward)
+            dist_loss = self.dist_loss(posterior_dist, prior_dist)
+            
+            loss = recon_loss + reward_loss + dist_loss 
+            
+            total_loss += loss
+            total_recon_loss += recon_loss
+            total_reward_loss += reward_loss
+            total_dist_loss += dist_loss
+            
+            latent = posterior_latent
+            
+        total_recon_loss = total_recon_loss / len(next_states)
+        total_reward_loss = total_reward_loss / len(next_states)
+        total_dist_loss = total_dist_loss / len(next_states)
+        total_loss = total_loss / len(next_states)        
         self.optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         self.optimizer.step()
         
-        return loss
+        return total_loss.item(), total_recon_loss.item(), total_reward_loss.item(), total_dist_loss.item()
                                    
         
 class Actor(nn.Module):
@@ -228,7 +267,10 @@ class ReplayBuffer:
         episode = self.episodes[np.random.randint(len(self.episodes))]        
         if len(episode) > self.sequence_length:
             start = np.random.randint(len(episode) - self.sequence_length + 1)
-            episode = episode[start:start + self.sequence_length]
+            sequence = episode[start:start + self.sequence_length]
+        else:
+            start = 0  
+            sequence = episode          
         
         states = []
         actions = []
@@ -236,14 +278,19 @@ class ReplayBuffer:
         next_states = []
         dones = []
         
-        for transition in episode:
+        for transition in sequence:
             states.append(transition["state"])
             actions.append(transition["action"])
             rewards.append(transition["reward"])
             next_states.append(transition["next_state"])
             dones.append(transition["done"])
         
-        return states, actions, rewards, next_states, dones
+        states = torch.stack(states)
+        actions = torch.stack(actions)
+        rewards = torch.stack(rewards)
+        next_states = torch.stack(next_states)  
+        
+        return states, actions, rewards, next_states, dones, episode, start
         
     def __len__(self):
         return len(self.episodes)
@@ -346,22 +393,18 @@ if __name__ == "__main__":
                 del agent_dictionary[agent_id]           
         
         if len(buffer) > 0:    
-            states, actions, rewards, next_states, dones = buffer.sample()             
-            memory = torch.zeros(1, memory_dim)
-            latent = torch.zeros(1, latent_dim)
-            
-            for t in range(len(states)):
-                state = states[t].unsqueeze(0)
-                action = actions[t].unsqueeze(0)
-                reward = rewards[t].unsqueeze(0).unsqueeze(0)
+            states, actions, rewards, next_states, dones, episode, start = buffer.sample()             
+            total_loss, recon_loss, reward_loss, dist_loss = agent.world_model.update(start, episode, memory, latent, actions, rewards, next_states)
+            if step % 100 == 0:
+                print(
+                    step,
+                    "total_loss:", total_loss,
+                    "recon_loss:", recon_loss,
+                    "reward_loss:", reward_loss,
+                    "dist_loss:", dist_loss
+                )
+        
 
-                loss = agent.world_model.update(state, latent, action, memory, reward)
-        
-        
-        
-            
-        if step % 100 == 0:
-            print(step)
              
 
         
