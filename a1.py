@@ -118,6 +118,7 @@ class WorldModel(nn.Module):
         
     def dist_loss(self, posterior_dist, prior_dist):
         dist_loss = torch.distributions.kl_divergence(posterior_dist, prior_dist).mean()
+        dist_loss = torch.clamp(dist_loss, min=3.0)
         return dist_loss  
     
     def update(self, episodes, starts, states, actions, rewards, next_states, dones):
@@ -180,7 +181,7 @@ class WorldModel(nn.Module):
         total_loss.backward()
         self.optimizer.step()
 
-        return total_loss.item(), total_recon_loss.item(), total_reward_loss.item(), total_dist_loss.item()   
+        return total_loss.item(), total_recon_loss.item(), total_reward_loss.item(), total_dist_loss.item(), memory.detach(), latent.detach()   
                            
         
 class Actor(nn.Module):
@@ -225,43 +226,95 @@ class Agent(nn.Module):
         self.actor = Actor(action_dim)
         self.critic = Critic()
         
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-4)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-4)
 
-    def imagine_with_AC(self, memory, latent):
+    def imagine_with_AC(self, memory, latent, horizon=15):
+        pred_values = []
+        pred_rewards = []
+        
+        for t in range(horizon):
+            action = self.actor(memory, latent)
+            memory, prior_latent = self.world_model.rssm.imagine(latent, action, memory)
+
+            pred_value = self.critic(memory, prior_latent)
+            pred_reward = self.world_model.reward_model(memory, prior_latent)
+            
+            pred_values.append(pred_value)
+            pred_rewards.append(pred_reward)
+            
+            latent = prior_latent
+            
         action = self.actor(memory, latent)
         memory, prior_latent = self.world_model.rssm.imagine(latent, action, memory)
-
         pred_value = self.critic(memory, prior_latent)
-        pred_reward = self.world_model.reward_model(memory, prior_latent)
+        pred_values.append(pred_value)   
         
-        return pred_value, pred_reward
-
-    def actor_loss(self, pred_reward):
-        actor_loss = -pred_reward
+        pred_values = torch.stack(pred_values, dim=1)
+        pred_rewards = torch.stack(pred_rewards, dim=1)
+        
+        return pred_values, pred_rewards
+    
+    def compute_return(self, rewards, values, gamma=0.99, lambda_=0.95):
+        B, H, _ = rewards.shape
+        returns = torch.zeros_like(rewards)
+        next_returns = values[:, -1, :]
+        
+        for t in reversed(range(H)):
+            if t == H-1:
+                next_values = values[:, -1, :]
+            else:
+                next_values = values[:, t+1, :]
+                
+            next_returns = rewards[:, t, :] + gamma * ((1 - lambda_) * next_values + lambda_ * next_returns)            
+            returns[:, t, :] = next_returns
+            
+        return returns    
+    
+    def actor_loss(self, returns):
+        actor_loss = -returns.mean()
         return actor_loss
         
-    def critic_loss(self, value, pred_value):
-        critic_loss = F.mse_loss(value, pred_value)
+    def critic_loss(self, pred_values, returns):
+        critic_loss = F.mse_loss(pred_values, returns.detach())
         return critic_loss
     
-    def update(self, memory, latent, value):
+    def update(self, memory, latent):
         for param in self.world_model.parameters():
             param.requires_grad = False
         
-        pred_value, pred_reward = self.imagine_with_AC(memory, latent)     
+        pred_values, pred_rewards = self.imagine_with_AC(memory, latent)
+        returns = self.compute_return(pred_rewards, pred_values)     
         
-        actor_loss = self.actor_loss(pred_reward)
-        critic_loss = self.critic_loss(value, pred_value)
+        for param in self.critic.parameters():
+            param.requires_grad = False
+            
+        actor_loss = self.actor_loss(returns)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
         
-        loss = actor_loss + critic_loss
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
+        for param in self.critic.parameters():
+            param.requires_grad = True        
+        
+        for param in self.actor.parameters():
+            param.requires_grad = False
+            
+        pred_values, pred_rewards = self.imagine_with_AC(memory, latent)
+        returns = self.compute_return(pred_rewards, pred_values) 
+                
+        critic_loss = self.critic_loss(pred_values[:, :-1, :], returns)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+        
+        for param in self.actor.parameters():
+            param.requires_grad = True
         
         for param in self.world_model.parameters():
             param.requires_grad = True
             
-        return loss
+        return actor_loss.item(), critic_loss.item()
         
 
 class ReplayBuffer:
@@ -284,7 +337,7 @@ class ReplayBuffer:
         elif max_length >= 20:
             self.sequence_length = 10
         else:
-            self.sequence_length = 5
+            self.sequence_length = 1
         
     def add_episode(self, episode):
         if len(self.episodes) >= self.capacity:
@@ -430,14 +483,18 @@ if __name__ == "__main__":
         
         if len(buffer) > 0:    
             episodes, starts, states, actions, rewards, next_states, dones = buffer.sample()             
-            total_loss, recon_loss, reward_loss, dist_loss = agent.world_model.update(episodes, starts, states, actions, rewards, next_states, dones)
-            if step % 10 == 0:
+            world_model_loss, recon_loss, reward_loss, dist_loss, memory, latent = agent.world_model.update(episodes, starts, states, actions, rewards, next_states, dones)
+            actor_loss, critic_loss = agent.update(memory, latent)
+            
+            if step % 100 == 0:
                 print(
                     step,
-                    "total_loss:", total_loss,
+                    "world_model_loss:", world_model_loss,
                     "recon_loss:", recon_loss,
                     "reward_loss:", reward_loss,
-                    "dist_loss:", dist_loss
+                    "dist_loss:", dist_loss,
+                    "actor_loss:", actor_loss,
+                    "critic_loss:", critic_loss
                 )
         
 
