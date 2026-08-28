@@ -120,74 +120,68 @@ class WorldModel(nn.Module):
         dist_loss = torch.distributions.kl_divergence(posterior_dist, prior_dist).mean()
         return dist_loss  
     
-    def update(self, batch):
-        batch_size = len(batch)
-        total_loss = 0.0
+    def update(self, episodes, starts, states, actions, rewards, next_states, dones):
+        batch_size = states.shape[0]
+        sequence_length = states.shape[1]
+        
         total_recon_loss = 0.0
         total_reward_loss = 0.0
         total_dist_loss = 0.0
         
-        for sample in batch:
-            episode = sample["episode"]
-            start = sample["start"]
-            actions = sample["actions"]
-            rewards = sample["rewards"]
-            next_states = sample["next_states"]
+        memories = []
+        latents = []
         
-            with torch.no_grad():
+        with torch.no_grad():
+            for i in range(batch_size):
                 initial_memory = torch.zeros(1, self.memory_dim)
                 initial_latent = torch.zeros(1, self.latent_dim)
-                initial_action = torch.zeros(1, self.action_dim)            
-                state = episode[0]["state"].unsqueeze(0)
+                initial_action = torch.zeros(1, self.action_dim)
+                
+                state = episodes[i][0]["state"].unsqueeze(0)
                 embed = self.encoder(state)
-                memory, _, latent, _, _ = self.rssm.observe(initial_latent, initial_action, initial_memory, embed)
-            
-                for t in range(start):
-                    action = episode[t]["action"].unsqueeze(0)  
-                    next_state = episode[t]["next_state"].unsqueeze(0)         
+                memory, _, latent, _, _ = self.rssm.observe(initial_latent, initial_action, initial_memory, embed)                 
+                
+                for t in range(starts[i]):
+                    action = episodes[i][t]["action"].unsqueeze(0)
+                    next_state = episodes[i][t]["next_state"].unsqueeze(0)
                     embed = self.encoder(next_state)
-                    memory, _, latent, _, _ = self.rssm.observe(latent, action, memory, embed)        
+                    memory, _, latent, _, _ = self.rssm.observe(latent, action, memory, embed)                  
+                
+                memories.append(memory.squeeze(0))
+                latents.append(latent.squeeze(0))
+                
+        memory = torch.stack(memories)
+        latent = torch.stack(latents)
+        
+        for t in range(sequence_length):
+            action = actions[:, t, :]
+            reward = rewards[:, t].unsqueeze(-1)
+            next_state = next_states[:, t, :]
             
-            sample_loss = 0.0
-            sample_recon_loss = 0.0
-            sample_reward_loss = 0.0
-            sample_dist_loss = 0.0
-            for t in range(len(next_states)):
-                action = actions[t].unsqueeze(0)
-                reward = rewards[t].unsqueeze(0).unsqueeze(0)
-                next_state = next_states[t].unsqueeze(0)            
-                embed = self.encoder(next_state)
-                memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, action, memory, embed)
-    
-                recon_loss = self.recon_loss(memory, posterior_latent, next_state)
-                reward_loss = self.reward_loss(memory, posterior_latent, reward)
-                dist_loss = self.dist_loss(posterior_dist, prior_dist)
+            embed = self.encoder(next_state)
+            memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, action, memory, embed)
+        
+            recon_loss = self.recon_loss(memory, posterior_latent, next_state)
+            reward_loss = self.reward_loss(memory, posterior_latent, reward)
+            dist_loss = self.dist_loss(posterior_dist, prior_dist)
+        
+            total_recon_loss += recon_loss
+            total_reward_loss += reward_loss
+            total_dist_loss += dist_loss
             
-                loss = recon_loss + reward_loss + dist_loss 
+            latent = posterior_latent
             
-                sample_loss += loss
-                sample_recon_loss += recon_loss
-                sample_reward_loss += reward_loss
-                sample_dist_loss += dist_loss
-            
-                latent = posterior_latent
-            
-            total_loss += sample_loss / len(next_states)
-            total_recon_loss += sample_recon_loss / len(next_states)
-            total_reward_loss += sample_reward_loss / len(next_states)
-            total_dist_loss += sample_dist_loss / len(next_states)
-            
-        total_loss = total_loss / batch_size 
-        total_recon_loss = total_recon_loss / batch_size
-        total_reward_loss = total_reward_loss / batch_size
-        total_dist_loss = total_dist_loss / batch_size
-
+        total_recon_loss /= sequence_length
+        total_reward_loss /= sequence_length
+        total_dist_loss /= sequence_length
+        
+        total_loss = total_recon_loss + total_reward_loss + total_dist_loss
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
-        
-        return total_loss.item(), total_recon_loss.item(), total_reward_loss.item(), total_dist_loss.item()
-                                   
+
+        return total_loss.item(), total_recon_loss.item(), total_reward_loss.item(), total_dist_loss.item()   
+                           
         
 class Actor(nn.Module):
     def __init__(self, action_dim, hidden_dim=256, latent_dim=64):
@@ -277,47 +271,62 @@ class ReplayBuffer:
         self.batch_size = batch_size
         self.sequence_length = sequence_length
         
+    def update_sequence_length(self):
+        max_length = max(len(episode) for episode in self.episodes)
+        if max_length >= 100:
+            self.sequence_length = 50
+        elif max_length >= 80:
+            self.sequence_length = 40
+        elif max_length >= 60:
+            self.sequence_length = 30
+        elif max_length >= 40:
+            self.sequence_length = 20
+        elif max_length >= 20:
+            self.sequence_length = 10
+        else:
+            self.sequence_length = 5
+        
     def add_episode(self, episode):
         if len(self.episodes) >= self.capacity:
             self.episodes.pop(0)            
         self.episodes.append(episode)
         
     def sample(self):
-        batch = []
+        self.update_sequence_length()
         
+        episodes = []
+        starts = []
+        
+        states = []
+        actions = []
+        rewards = []
+        next_states = []
+        dones = []
+        
+        valid_episodes = [episode for episode in self.episodes if len(episode) >= self.sequence_length]
         for _ in range(self.batch_size):
-            episode = self.episodes[np.random.randint(len(self.episodes))]        
-            if len(episode) > self.sequence_length:
-                start = np.random.randint(len(episode) - self.sequence_length + 1)
-                sequence = episode[start:start + self.sequence_length]
-            else:
-                start = 0  
-                sequence = episode          
-        
-            states = []
-            actions = []
-            rewards = []
-            next_states = []
-            dones = []
-        
-            for transition in sequence:
-                states.append(transition["state"])
-                actions.append(transition["action"])
-                rewards.append(transition["reward"])
-                next_states.append(transition["next_state"])
-                dones.append(transition["done"])
+            episode = valid_episodes[np.random.randint(len(valid_episodes))]        
+            start = np.random.randint(
+                0,
+                len(episode) - self.sequence_length + 1
+            )
+            sequence = episode[start:start + self.sequence_length]                     
             
-            batch.append({
-                "episode": episode,
-                "start": start,
-                "states": torch.stack(states),
-                "actions": torch.stack(actions),
-                "rewards": torch.stack(rewards),
-                "next_states": torch.stack(next_states),
-                "dones": dones
-            })  
+            episodes.append(episode)
+            starts.append(start)
+            
+            states.append(torch.stack([transition["state"] for transition in sequence]))
+            actions.append(torch.stack([transition["action"] for transition in sequence]))
+            rewards.append(torch.stack([transition["reward"] for transition in sequence]))
+            next_states.append(torch.stack([transition["next_state"] for transition in sequence]))
+            dones.append([transition["done"] for transition in sequence])
+            
+        states = torch.stack(states)
+        actions = torch.stack(actions)
+        rewards = torch.stack(rewards)
+        next_states = torch.stack(next_states)  
         
-        return batch
+        return episodes, starts,states, actions, rewards, next_states, dones
         
     def __len__(self):
         return len(self.episodes)
@@ -420,8 +429,8 @@ if __name__ == "__main__":
                 del agent_dictionary[agent_id]           
         
         if len(buffer) > 0:    
-            batch = buffer.sample()             
-            total_loss, recon_loss, reward_loss, dist_loss = agent.world_model.update(batch)
+            episodes, starts, states, actions, rewards, next_states, dones = buffer.sample()             
+            total_loss, recon_loss, reward_loss, dist_loss = agent.world_model.update(episodes, starts, states, actions, rewards, next_states, dones)
             if step % 10 == 0:
                 print(
                     step,
