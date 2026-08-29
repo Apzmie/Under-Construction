@@ -11,7 +11,7 @@ BASE_DIR = ""
 
 
 class Encoder(nn.Module):
-    def __init__(self, state_dim, hidden_dim=256, embed_dim=128):
+    def __init__(self, state_dim, hidden_dim=128, embed_dim=64):
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -25,7 +25,7 @@ class Encoder(nn.Module):
         
 
 class RSSM(nn.Module):
-    def __init__(self, action_dim, latent_dim=64, hidden_dim=256, embed_dim=128):
+    def __init__(self, action_dim, latent_dim=32, hidden_dim=128, embed_dim=64):
         super().__init__()
         self.gru = nn.GRUCell(latent_dim + action_dim, hidden_dim)        
         self.posterior_mean = nn.Linear(hidden_dim + embed_dim, latent_dim)
@@ -63,7 +63,7 @@ class RSSM(nn.Module):
 
         
 class Decoder(nn.Module):
-    def __init__(self, state_dim, hidden_dim=256, latent_dim=64):
+    def __init__(self, state_dim, hidden_dim=128, latent_dim=32):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)  
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -78,7 +78,7 @@ class Decoder(nn.Module):
         
         
 class RewardModel(nn.Module):
-    def __init__(self, hidden_dim=256, latent_dim=64):
+    def __init__(self, hidden_dim=128, latent_dim=32):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -93,7 +93,7 @@ class RewardModel(nn.Module):
         
 
 class WorldModel(nn.Module):
-    def __init__(self, state_dim, action_dim, memory_dim=256, latent_dim=64):
+    def __init__(self, state_dim, action_dim, memory_dim=128, latent_dim=32):
         super().__init__()
         self.encoder = Encoder(state_dim)
         self.rssm = RSSM(action_dim)
@@ -186,7 +186,7 @@ class WorldModel(nn.Module):
                            
         
 class Actor(nn.Module):
-    def __init__(self, action_dim, hidden_dim=256, latent_dim=64):
+    def __init__(self, action_dim, hidden_dim=128, latent_dim=32):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -213,7 +213,7 @@ class Actor(nn.Module):
         return action
                 
 class Critic(nn.Module):
-    def __init__(self, hidden_dim=256, latent_dim=64):
+    def __init__(self, hidden_dim=128, latent_dim=32):
         super().__init__()
         self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -234,8 +234,8 @@ class Agent(nn.Module):
         self.actor = Actor(action_dim)
         self.critic = Critic()
         
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=5e-8)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=5e-8)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=8e-5)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=8e-5)
 
     def imagine_with_AC(self, memory, latent, horizon=15):
         pred_values = []
@@ -412,17 +412,19 @@ if __name__ == "__main__":
     state_dim = spec.observation_specs[0].shape[0]
     action_dim = spec.action_spec.continuous_size
     agent = Agent(state_dim, action_dim)
+    #agent.load_state_dict(torch.load(f"{BASE_DIR}/period_model.pth"))
     buffer = ReplayBuffer()
     writer = SummaryWriter(log_dir=BASE_DIR)        
     
-    memory_dim, latent_dim = 256, 64
+    memory_dim, latent_dim = 128, 32
     max_step = 500
-    update_interval = 5
-    update_iterations = 10
+    update_interval = 10
+    update_iterations = 100
     test_interval = 50
     num_agents = 24
     
     agent_dictionary = {}
+    add_episode = 0
     update_count = 0
     best_test_reward = -float('inf')
     save_idx = 0
@@ -500,114 +502,115 @@ if __name__ == "__main__":
             
             if done or len(agent_dictionary[agent_id]["transitions"]) >= max_step:
                 episode = agent_dictionary[agent_id]["transitions"]
-                buffer.add_episode(episode)                
+                buffer.add_episode(episode)
+                add_episode += 1                
                 if done:
                     del agent_dictionary[agent_id]
                 else:
                     agent_dictionary[agent_id]["transitions"] = []           
         
-        if len(buffer) > 0 and len(buffer) % update_interval == 0:    
-            for _ in range(update_iterations):
-                episodes, starts, states, actions, rewards, next_states, dones = buffer.sample()             
-                total_loss, recon_loss, reward_loss, dist_loss, memory, latent = agent.world_model.update(episodes, starts, states, actions, rewards, next_states, dones)
-                actor_loss, critic_loss = agent.update(memory, latent)
+                if add_episode > 0 and add_episode % update_interval == 0:    
+                    for _ in range(update_iterations):
+                        episodes, starts, states, actions, rewards, next_states, dones = buffer.sample()             
+                        total_loss, recon_loss, reward_loss, dist_loss, memory, latent = agent.world_model.update(episodes, starts, states, actions, rewards, next_states, dones)
+                        actor_loss, critic_loss = agent.update(memory, latent)
                 
-                writer.add_scalar("Train/WorldModel_Total_Loss", total_loss, update_count)
-                writer.add_scalar("Train/WorldModel_Reconstruction_Loss", recon_loss, update_count)
-                writer.add_scalar("Train/WorldModel_Reward_Loss", reward_loss, update_count)
-                writer.add_scalar("Train/WorldModel_Distribution_Loss", dist_loss, update_count)
-                writer.add_scalar("Train/Actor_Loss", actor_loss, update_count)
-                writer.add_scalar("Train/Critic_Loss", critic_loss, update_count)
+                        writer.add_scalar("Train/WorldModel_Total_Loss", total_loss, update_count)
+                        writer.add_scalar("Train/WorldModel_Reconstruction_Loss", recon_loss, update_count)
+                        writer.add_scalar("Train/WorldModel_Reward_Loss", reward_loss, update_count)
+                        writer.add_scalar("Train/WorldModel_Distribution_Loss", dist_loss, update_count)
+                        writer.add_scalar("Train/Actor_Loss", actor_loss, update_count)
+                        writer.add_scalar("Train/Critic_Loss", critic_loss, update_count)
              
-                update_count += 1
+                        update_count += 1
                 
-            print(f"Update Count {update_count}")               
-            if update_count % test_interval == 0:
-                test_env.reset()
-                t_agent_dictionary = {}
-                t_step = 0
-                test_rewards = 0
+                    print(f"Update Count {update_count}")               
+                    if update_count % test_interval == 0:
+                        test_env.reset()
+                        t_agent_dictionary = {}
+                        t_step = 0
+                        test_rewards = 0
                 
-                while t_step < max_step:
-                    t_decision_steps, _ = test_env.get_steps(t_behavior_name)    
-                    t_agent_ids = t_decision_steps.agent_id
-                    if len(t_agent_ids) > 0:
-                        t_states_tensor = torch.from_numpy(t_decision_steps.obs[0]).to(torch.float32)
+                        while t_step < max_step:
+                            t_decision_steps, _ = test_env.get_steps(t_behavior_name)    
+                            t_agent_ids = t_decision_steps.agent_id
+                            if len(t_agent_ids) > 0:
+                                t_states_tensor = torch.from_numpy(t_decision_steps.obs[0]).to(torch.float32)
                     
-                        t_actions_for_unity = []
-                        for i, t_agent_id in enumerate(t_agent_ids):
-                            if t_agent_id not in t_agent_dictionary:
-                                t_memory = torch.zeros(1, memory_dim)
-                                t_latent = torch.zeros(1, latent_dim)
-                                t_action = torch.zeros(1, action_dim)
+                                t_actions_for_unity = []
+                                for i, t_agent_id in enumerate(t_agent_ids):
+                                    if t_agent_id not in t_agent_dictionary:
+                                        t_memory = torch.zeros(1, memory_dim)
+                                        t_latent = torch.zeros(1, latent_dim)
+                                        t_action = torch.zeros(1, action_dim)
                             
-                                t_state = t_states_tensor[i].unsqueeze(0)
-                                t_embed = agent.world_model.encoder(t_state)
-                                t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_embed)                
-                                t_agent_dictionary[t_agent_id] = {
-                                    "t_memory": t_memory.squeeze(0),
-                                    "t_latent": t_latent.squeeze(0),
-                                    "t_action": t_action.squeeze(0),
-                                }
+                                        t_state = t_states_tensor[i].unsqueeze(0)
+                                        t_embed = agent.world_model.encoder(t_state)
+                                        t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_embed)                
+                                        t_agent_dictionary[t_agent_id] = {
+                                            "t_memory": t_memory.squeeze(0),
+                                            "t_latent": t_latent.squeeze(0),
+                                            "t_action": t_action.squeeze(0),
+                                        }
                             
-                            t_memory = t_agent_dictionary[t_agent_id]["t_memory"].unsqueeze(0)
-                            t_latent = t_agent_dictionary[t_agent_id]["t_latent"].unsqueeze(0)
-                            with torch.no_grad():
-                                t_action = agent.actor.deterministic(t_memory, t_latent)
-                            t_action = t_action.squeeze(0)
-                            t_agent_dictionary[t_agent_id]["t_action"] = t_action
-                            t_actions_for_unity.append(t_action.numpy())
+                                    t_memory = t_agent_dictionary[t_agent_id]["t_memory"].unsqueeze(0)
+                                    t_latent = t_agent_dictionary[t_agent_id]["t_latent"].unsqueeze(0)
+                                    with torch.no_grad():
+                                        t_action = agent.actor.deterministic(t_memory, t_latent)
+                                    t_action = t_action.squeeze(0)
+                                    t_agent_dictionary[t_agent_id]["t_action"] = t_action
+                                    t_actions_for_unity.append(t_action.numpy())
                         
-                        t_actions_for_unity = np.array(t_actions_for_unity)
-                        test_env.set_actions(t_behavior_name, ActionTuple(continuous=t_actions_for_unity))    
+                                t_actions_for_unity = np.array(t_actions_for_unity)
+                                test_env.set_actions(t_behavior_name, ActionTuple(continuous=t_actions_for_unity))    
              
-                    test_env.step()
-                    t_step += 1
-                    t_next_decision_steps, t_terminal_steps = test_env.get_steps(t_behavior_name) 
+                            test_env.step()
+                            t_step += 1
+                            t_next_decision_steps, t_terminal_steps = test_env.get_steps(t_behavior_name) 
                           
-                    for i, t_agent_id in enumerate(t_agent_ids):
-                        if t_agent_id in t_next_decision_steps:
-                            t_reward = t_next_decision_steps[t_agent_id].reward
-                            t_next_obs = t_next_decision_steps[t_agent_id].obs[0]
-                            t_done = False
-                        elif t_agent_id in t_terminal_steps:
-                            t_reward = t_terminal_steps[t_agent_id].reward
-                            t_next_obs = t_terminal_steps[t_agent_id].obs[0]
-                            t_done = True
-                        else:
-                            continue
+                            for i, t_agent_id in enumerate(t_agent_ids):
+                                if t_agent_id in t_next_decision_steps:
+                                    t_reward = t_next_decision_steps[t_agent_id].reward
+                                    t_next_obs = t_next_decision_steps[t_agent_id].obs[0]
+                                    t_done = False
+                                elif t_agent_id in t_terminal_steps:
+                                    t_reward = t_terminal_steps[t_agent_id].reward
+                                    t_next_obs = t_terminal_steps[t_agent_id].obs[0]
+                                    t_done = True
+                                else:
+                                    continue
                             
-                        test_rewards += t_reward
+                                test_rewards += t_reward
             
-                        t_next_state = torch.from_numpy(t_next_obs).float().unsqueeze(0)
-                        t_next_embed = agent.world_model.encoder(t_next_state)
+                                t_next_state = torch.from_numpy(t_next_obs).float().unsqueeze(0)
+                                t_next_embed = agent.world_model.encoder(t_next_state)
             
-                        t_action = t_agent_dictionary[t_agent_id]["t_action"].unsqueeze(0)
-                        t_memory = t_agent_dictionary[t_agent_id]["t_memory"].unsqueeze(0)
-                        t_latent = t_agent_dictionary[t_agent_id]["t_latent"].unsqueeze(0)
+                                t_action = t_agent_dictionary[t_agent_id]["t_action"].unsqueeze(0)
+                                t_memory = t_agent_dictionary[t_agent_id]["t_memory"].unsqueeze(0)
+                                t_latent = t_agent_dictionary[t_agent_id]["t_latent"].unsqueeze(0)
             
-                        t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_next_embed)                
+                                t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_next_embed)                
             
-                        t_agent_dictionary[t_agent_id]["t_memory"] = t_memory.squeeze(0)
-                        t_agent_dictionary[t_agent_id]["t_latent"] = t_latent.squeeze(0)
+                                t_agent_dictionary[t_agent_id]["t_memory"] = t_memory.squeeze(0)
+                                t_agent_dictionary[t_agent_id]["t_latent"] = t_latent.squeeze(0)
                         
-                        if t_done:
-                            del t_agent_dictionary[t_agent_id]
+                                if t_done:
+                                    del t_agent_dictionary[t_agent_id]
                             
-                test_average_reward = test_rewards / num_agents
-                writer.add_scalar("Test/Average_Reward", test_average_reward, update_count)
-                print(f"[Test] {test_average_reward:.4f}")
-                torch.save({
-                    "model": agent.state_dict(),
-                    "world_model_optimizer": agent.world_model.optimizer.state_dict(),
-                    "actor_optimizer": agent.actor_optimizer.state_dict(),
-                    "critic_optimizer": agent.critic_optimizer.state_dict(),
-                }, f"{BASE_DIR}/checkpoint.pth")                 
-                torch.save(agent.state_dict(), f"{BASE_DIR}/period_model.pth")
+                        test_average_reward = test_rewards / num_agents
+                        writer.add_scalar("Test/Average_Reward", test_average_reward, update_count)
+                        print(f"[Test] {test_average_reward:.4f}")
+                        torch.save({
+                            "model": agent.state_dict(),
+                            "world_model_optimizer": agent.world_model.optimizer.state_dict(),
+                            "actor_optimizer": agent.actor_optimizer.state_dict(),
+                            "critic_optimizer": agent.critic_optimizer.state_dict(),
+                        }, f"{BASE_DIR}/checkpoint.pth")                 
+                        torch.save(agent.state_dict(), f"{BASE_DIR}/period_model.pth")
                  
-                if test_average_reward > best_test_reward:
-                    best_test_reward = test_average_reward
-                    save_idx += 1 
-                    torch.save(agent.state_dict(), f"{BASE_DIR}/#({save_idx})best_{best_test_reward:.4f}.pth")
-                    print(f"[Test] Model saved at new best reward {best_test_reward:.4f}")              
+                        if test_average_reward > best_test_reward:
+                            best_test_reward = test_average_reward
+                            save_idx += 1 
+                            torch.save(agent.state_dict(), f"{BASE_DIR}/#({save_idx})best_{best_test_reward:.4f}.pth")
+                            print(f"[Test] Model saved at new best reward {best_test_reward:.4f}")              
         
