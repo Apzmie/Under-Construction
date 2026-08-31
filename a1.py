@@ -31,9 +31,29 @@ class RSSM(nn.Module):
         self.posterior_mean = nn.Linear(hidden_dim + embed_dim, latent_dim)
         self.posterior_std = nn.Linear(hidden_dim + embed_dim, latent_dim)        
         self.prior_mean = nn.Linear(hidden_dim, latent_dim)
-        self.prior_std = nn.Linear(hidden_dim, latent_dim)         
+        self.prior_std = nn.Linear(hidden_dim, latent_dim)
         
-    def observe(self, latent, action, memory, embed):
+    #def gru(self, latent, action, memory):
+    #    input = torch.cat([latent, action], dim=-1)
+        
+    #    input_for_forget = self.W_forget_i(input)
+    #    memory_for_forget = self.W_forget_m(memory)
+        
+    #    forget_gate = torch.sigmoid(input_for_forget + memory_for_forget)       
+    #    forgotten_memory = forget_gate * memory
+           
+    #    forgotten_memory_info = self.W_info_m(forgotten_memory)                    
+    #    input_info = self.W_info_i(input)               
+    #    summed_info = torch.tanh(forgotten_memory_info + input_info)
+        
+    #    input_for_update = self.W_update_i(input)
+    #    memory_for_update = self.W_update_m(memory)
+
+    #    update_gate = torch.sigmoid(input_for_update + memory_for_update)        
+    #    updated_memory = (1 - update_gate) * memory + update_gate * summed_info
+    #    return updated_memory         
+        
+    def observe(self, latent, action, memory, embed, sample=True):
         gru_input = torch.cat([latent, action], dim=-1)
         memory = self.gru(gru_input, memory)
         
@@ -41,7 +61,7 @@ class RSSM(nn.Module):
         posterior_mean = self.posterior_mean(posterior_input)
         posterior_std = F.softplus(self.posterior_std(posterior_input)) + 1e-4
         posterior_dist = torch.distributions.Normal(posterior_mean, posterior_std)
-        posterior_latent = posterior_dist.rsample()
+        posterior_latent = (posterior_dist.rsample() if sample else posterior_dist.mean)
         
         prior_mean = self.prior_mean(memory)
         prior_std = F.softplus(self.prior_std(memory)) + 1e-4
@@ -198,7 +218,7 @@ class Actor(nn.Module):
         x = F.elu(self.fc1(x))
         x = F.elu(self.fc2(x))
         mean = self.mean(x)
-        std = F.softplus(self.std(x)) + 1e-4                
+        std = F.softplus(self.std(x)) + 1e-4
         dist = torch.distributions.Normal(mean, std)
         action = dist.rsample()
         action = torch.tanh(action)
@@ -417,10 +437,10 @@ if __name__ == "__main__":
     writer = SummaryWriter(log_dir=BASE_DIR)        
     
     memory_dim, latent_dim = 128, 32
-    max_step = 500
-    update_interval = 10
+    max_step = 200
+    update_interval = 5
     update_iterations = 100
-    test_interval = 50
+    test_interval = 100
     num_agents = 24
     
     agent_dictionary = {}
@@ -444,7 +464,7 @@ if __name__ == "__main__":
             
                     state = states_tensor[i].unsqueeze(0)
                     embed = agent.world_model.encoder(state)
-                    memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, embed)                
+                    memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, embed, sample=False)                
             
                     agent_dictionary[agent_id] = {
                         "memory": memory.squeeze(0),
@@ -495,7 +515,7 @@ if __name__ == "__main__":
             memory = agent_dictionary[agent_id]["memory"].unsqueeze(0)
             latent = agent_dictionary[agent_id]["latent"].unsqueeze(0)
             
-            memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, next_embed)                
+            memory, _, latent, _, _ = agent.world_model.rssm.observe(latent, action, memory, next_embed, sample=False)                
             
             agent_dictionary[agent_id]["memory"] = memory.squeeze(0)
             agent_dictionary[agent_id]["latent"] = latent.squeeze(0)
@@ -546,7 +566,7 @@ if __name__ == "__main__":
                             
                                         t_state = t_states_tensor[i].unsqueeze(0)
                                         t_embed = agent.world_model.encoder(t_state)
-                                        t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_embed)                
+                                        t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_embed, sample=False)                
                                         t_agent_dictionary[t_agent_id] = {
                                             "t_memory": t_memory.squeeze(0),
                                             "t_latent": t_latent.squeeze(0),
@@ -589,7 +609,7 @@ if __name__ == "__main__":
                                 t_memory = t_agent_dictionary[t_agent_id]["t_memory"].unsqueeze(0)
                                 t_latent = t_agent_dictionary[t_agent_id]["t_latent"].unsqueeze(0)
             
-                                t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_next_embed)                
+                                t_memory, _, t_latent, _, _ = agent.world_model.rssm.observe(t_latent, t_action, t_memory, t_next_embed, sample=False)                
             
                                 t_agent_dictionary[t_agent_id]["t_memory"] = t_memory.squeeze(0)
                                 t_agent_dictionary[t_agent_id]["t_latent"] = t_latent.squeeze(0)
