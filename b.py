@@ -133,7 +133,38 @@ class Agent:
         imagined_next_states = torch.stack(imagined_next_states, dim=1)
         
         return imagined_states, imagined_actions, imagined_rewards, imagined_next_states            
+    
+    def critic_loss(self, state, action, reward, next_state, done=0, gamma=0.99):
+        with torch.no_grad():
+            next_action, next_log_prob = self.actor.sample(next_state)
+            
+            next_q1 = self.critic1_target(next_state, next_action)
+            next_q2 = self.critic2_target(next_state, next_action)
+            next_q = torch.min(next_q1, next_q2)
+            
+            alpha = self.log_alpha.exp()            
+            target_q = reward + gamma * (1 - done) * (next_q - alpha * next_log_prob)
         
+        q1 = self.critic1(state, action)
+        q2 = self.critic2(state, action)
+        
+        critic1_loss = F.mse_loss(q1, target_q)
+        critic2_loss = F.mse_loss(q2, target_q)
+        
+        return critic1_loss, critic2_loss
+        
+    def actor_loss(self, state):
+        action_new, log_prob = self.actor.sample(state)
+        
+        q1_new = self.critic1(state, action_new)
+        q2_new = self.critic2(state, action_new)
+        q_new = torch.min(q1_new, q2_new)
+        
+        alpha = self.log_alpha.exp().detach()    
+        actor_loss = -(q_new - alpha * log_prob).mean()
+        
+        return actor_loss, log_prob
+            
     def update_target(self, net, target_net, tau=0.005):
         with torch.no_grad():
             for param, target_param in zip(net.parameters(), target_net.parameters()):
@@ -159,20 +190,15 @@ class Agent:
         #==========================================
         
         with torch.no_grad():
-            next_action, next_log_prob = self.actor.sample(next_state)
+            imagined_states, imagined_actions, imagined_rewards, imagined_next_states = self.imagine(state)
             
-            next_q1 = self.critic1_target(next_state, next_action)
-            next_q2 = self.critic2_target(next_state, next_action)
-            next_q = torch.min(next_q1, next_q2)
-            
-            alpha = self.log_alpha.exp()            
-            target_q = reward + gamma * (1 - done) * (next_q - alpha * next_log_prob)
-            
-        q1 = self.critic1(state, action)
-        q2 = self.critic2(state, action)
+        B, H, _ = imagined_states.shape
+        imagined_states = imagined_states.reshape(B * H, -1)
+        imagined_actions = imagined_actions.reshape(B * H, -1)
+        imagined_rewards = imagined_rewards.reshape(B * H, -1)
+        imagined_next_states = imagined_next_states.reshape(B * H, -1)
         
-        critic1_loss = F.mse_loss(q1, target_q)
-        critic2_loss = F.mse_loss(q2, target_q)
+        critic1_loss, critic2_loss = self.critic_loss(imagined_states, imagined_actions, imagined_rewards, imagined_next_states)      
         
         self.critic1_optimizer.zero_grad()
         critic1_loss.backward()
@@ -191,14 +217,8 @@ class Agent:
         for p in self.critic2.parameters():
             p.requires_grad = False
         
-        action_new, log_prob = self.actor.sample(state)
-        
-        q1_new = self.critic1(state, action_new)
-        q2_new = self.critic2(state, action_new)
-        q_new = torch.min(q1_new, q2_new)
-        
-        alpha = self.log_alpha.exp().detach()    
-        actor_loss = -(q_new - alpha * log_prob).mean()
+        imagined_states, imagined_actions, imagined_rewards, imagined_next_states = self.imagine(state)
+        actor_loss, log_prob = self.actor_loss(imagined_states)
         
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
