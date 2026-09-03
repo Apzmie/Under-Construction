@@ -217,10 +217,11 @@ class Agent:
         
         
 class ReplayBuffer:
-    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=256, seq_len=50):
+    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=256, max_seq_len=50):
         self.max_size = max_size
         self.batch_size = batch_size
-        self.seq_len = seq_len
+        self.current_seq_len = 1
+        self.max_seq_len = max_seq_len
         self.ptr = 0
         self.size = 0
 
@@ -248,27 +249,34 @@ class ReplayBuffer:
     
     def update_seq_len(self):
         lengths = []
-        
+
         for _ in range(self.batch_size):
             start = np.random.randint(0, self.size)
-            
+
             agent_id = self.agent_id[start]
             episode_id = self.episode_id[start]
-            
-            indices = np.where((self.agent_id == agent_id) & (self.episode_id == episode_id))[0]               
+
+            indices = np.where((self.agent_id == agent_id) & (self.episode_id == episode_id))[0] 
             start_pos = np.where(indices == start)[0][0]
-            
+
             length = len(indices) - start_pos
             lengths.append(length)
-                           
-        self.seq_len = min(min(lengths), 50)
+
+        max_length = max(lengths)
+        if max_length >= self.max_seq_len:
+            return self.max_seq_len
+        else:
+            return max(self.current_seq_len, max_length // 2)
     
     def sample(self):
+        if self.current_seq_len < self.max_seq_len:
+            self.current_seq_len = self.update_seq_len()
+            
         sequences = []
         
         while len(sequences) < self.batch_size:
             start = np.random.randint(0, self.size)
-            if start + self.seq_len > self.size:
+            if start + self.current_seq_len > self.size:
                 continue
             
             agent_id = self.agent_id[start]
@@ -276,10 +284,10 @@ class ReplayBuffer:
             
             indices = np.where((self.agent_id == agent_id) & (self.episode_id == episode_id))[0]               
             start_pos = np.where(indices == start)[0][0]
-            if start_pos + self.seq_len > len(indices):
+            if start_pos + self.current_seq_len > len(indices):
                 continue
                 
-            seq_indices = indices[start_pos:start_pos + self.seq_len]
+            seq_indices = indices[start_pos:start_pos + self.current_seq_len]
             if np.any(self.done[seq_indices[:-1]]):
                 continue
                 
