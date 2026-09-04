@@ -11,24 +11,135 @@ from torch.utils.tensorboard import SummaryWriter
 BASE_DIR = ""
 
 
+class RSSM(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, latent_dim=32):
+        super().__init__()
+        self.gru = nn.GRUCell(latent_dim + action_dim, hidden_dim)
+        self.posterior_mean = nn.Linear(hidden_dim + state_dim, latent_dim)
+        self.posterior_log_std = nn.Linear(hidden_dim + state_dim, latent_dim)
+        self.prior_mean = nn.Linear(hidden_dim, latent_dim)
+        self.prior_log_std = nn.Linear(hidden_dim, latent_dim)
+        
+    def observe(self, latent, action, memory, next_state):
+        gru_input = torch.cat([latent, action], dim=-1)
+        memory = self.gru(gru_input, memory)
+        
+        posterior_input = torch.cat([memory, next_state], dim=-1)
+        posterior_mean = self.posterior_mean(posterior_input)
+        posterior_log_std = torch.clamp(self.posterior_log_std(posterior_input), -5, 2)
+        posterior_std = torch.exp(posterior_log_std)
+        posterior_dist = torch.distributions.Normal(posterior_mean, posterior_std)
+        posterior_latent = posterior_dist.rsample()
+        
+        prior_mean = self.prior_mean(memory)
+        prior_log_std = torch.clamp(self.prior_log_std(memory), -5, 2)
+        prior_std = torch.exp(prior_log_std)
+        prior_dist = torch.distributions.Normal(prior_mean, prior_std)
+        prior_latent = prior_dist.rsample()
+        
+        return memory, posterior_dist, posterior_latent, prior_dist, prior_latent
+        
+    def imagine(self, latent, action, memory):
+        gru_input = torch.cat([latent, action], dim=-1)
+        memory = self.gru(gru_input, memory)
+        
+        prior_mean = self.prior_mean(memory)
+        prior_log_std = torch.clamp(self.prior_log_std(memory), -5, 2)
+        prior_std = torch.exp(prior_log_std)
+        prior_dist = torch.distributions.Normal(prior_mean, prior_std)
+        prior_latent = prior_dist.rsample()
+
+        return memory, prior_latent
+        
+        
+class Decoder(nn.Module):
+    def __init__(self, state_dim, hidden_dim=256, latent_dim=32):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)  
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.recon = nn.Linear(hidden_dim, state_dim)
+        
+    def forward(self, memory, latent):
+        x = torch.cat([memory, latent], dim=-1)        
+        x = F.elu(self.fc1(x))
+        x = F.elu(self.fc2(x))
+        recon = self.recon(x)
+        return recon
+        
+        
+class RewardModel(nn.Module):
+    def __init__(self, hidden_dim=256, latent_dim=32):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.reward = nn.Linear(hidden_dim, 1)
+        
+    def forward(self, memory, latent):
+        x = torch.cat([memory, latent], dim=-1)
+        x = F.elu(self.fc1(x))
+        x = F.elu(self.fc2(x))
+        reward = self.reward(x)
+        return reward
+
+
 class WorldModel(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)        
-        self.next_state = nn.Linear(hidden_dim, state_dim)
-        self.reward = nn.Linear(hidden_dim, 1)
+        self.rssm = RSSM(state_dim, action_dim)
+        self.decoder = Decoder(state_dim)
+        self.reward_model = RewardModel()
+    
+    def recon_loss(self, memory, posterior_latent, next_state):
+        recon = self.decoder(memory, posterior_latent)
+        recon_loss = F.mse_loss(next_state, recon)  
+        return recon_loss
         
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        x = F.elu(self.fc1(x))
-        x = F.elu(self.fc2(x))
+    def reward_loss(self, memory, posterior_latent, reward):
+        pred_reward = self.reward_model(memory, posterior_latent)
+        reward_loss = F.mse_loss(reward, pred_reward)
+        return reward_loss
         
-        next_state = self.next_state(x)
-        reward = self.reward(x)
+    def dist_loss(self, posterior_dist, prior_dist):
+        dist_loss = torch.distributions.kl_divergence(posterior_dist, prior_dist).mean()
+        return dist_loss
         
-        return next_state, reward
+    def loss(self, memory, posterior_latent, next_state, reward, posterior_dist, prior_dist):
+        recon_loss = self.recon_loss(memory, posterior_latent, next_state)
+        reward_loss = self.reward_loss(memory, posterior_latent, reward)
+        dist_loss = self.dist_loss(posterior_dist, prior_dist)        
+        total_loss = recon_loss + reward_loss + dist_loss
         
+        return total_loss, recon_loss, reward_loss, dist_loss
+        
+    def forward(self, states, actions, rewards, next_states):
+        states = torch.as_tensor(states, dtype=torch.float32)
+        actions = torch.as_tensor(actions, dtype=torch.float32)
+        rewards = torch.as_tensor(rewards, dtype=torch.float32)
+        next_states = torch.as_tensor(next_states, dtype=torch.float32)
+    
+        B = states.shape[0]
+        memory = torch.zeros(B, self.rssm.gru.hidden_size)
+        latent = torch.zeros(B, self.rssm.prior_mean.out_features)
+        
+        memories = []
+        posterior_latents = []
+        posterior_dists = []
+        prior_dists = []
+        
+        for t in range(states.shape[1]):
+            memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, actions[:, t], memory, next_states[:, t])
+            
+            memories.append(memory)
+            posterior_latents.append(posterior_latent)
+            posterior_dists.append(posterior_dist)
+            prior_dists.append(prior_dist)
+            
+            latent = posterior_latent
+            
+        memories = torch.stack(memories, dim=1)
+        posterior_latents = torch.stack(posterior_latents, dim=1)
+            
+        return memories, posterior_latents, posterior_dists, prior_dists
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
@@ -90,13 +201,15 @@ class Agent:
         self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr)
         
     def update_world_model(self, state, action, next_state, reward):
-        pred_next_state, pred_reward = self.world_model(state, action)
-        
-        recon_loss = F.mse_loss(next_state, pred_next_state)
-        reward_loss = F.mse_loss(reward, pred_reward) 
-        
-        total_loss = recon_loss + reward_loss
-        return total_loss, recon_loss, reward_loss
+        memories, posterior_latents, posterior_dists, prior_dists = self.world_model(state, action, reward, next_state)
+            
+            
+            
+            
+            
+            
+            
+            
         
     def imagine(self, state, horizon=15):
         imagined_states = []
@@ -155,7 +268,7 @@ class Agent:
         reward = torch.FloatTensor(batch['reward'])
         next_state = torch.FloatTensor(batch['next_state'])
         done = torch.FloatTensor(batch['done'])
-        
+
         #==========================================
         
         world_model_loss, recon_loss, reward_loss = self.update_world_model(state, action, next_state, reward)
@@ -172,7 +285,7 @@ class Agent:
             p.requires_grad = False 
         
         with torch.no_grad():
-            imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_values, imagined_next_values = self.imagine(state)
+            imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_values, imagined_next_values = self.imagine(state[:, -1, :])
             returns = self.compute_return(imagined_rewards, imagined_next_values)
         
         imagined_values = self.critic(imagined_states)
@@ -195,7 +308,7 @@ class Agent:
         for p in self.critic.parameters():
             p.requires_grad = False      
         
-        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_values, imagined_next_values = self.imagine(state)
+        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_values, imagined_next_values = self.imagine(state[:, -1, :])
         returns = self.compute_return(imagined_rewards, imagined_next_values)
         
         actor_loss = self.actor_loss(returns)        
@@ -217,7 +330,7 @@ class Agent:
         
         
 class ReplayBuffer:
-    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=256, max_seq_len=50):
+    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=50, max_seq_len=50):
         self.max_size = max_size
         self.batch_size = batch_size
         self.current_seq_len = 1
@@ -263,35 +376,52 @@ class ReplayBuffer:
             lengths.append(length)
 
         max_length = max(lengths)
-        if max_length >= self.max_seq_len:
-            return self.max_seq_len
+        if max_length >= self.current_seq_len:
+            return min(self.current_seq_len + 1, self.max_seq_len)
         else:
-            return max(self.current_seq_len, max_length // 2)
+            return self.current_seq_len
     
     def sample(self):
         if self.current_seq_len < self.max_seq_len:
             self.current_seq_len = self.update_seq_len()
             
-        sequences = []
+        print(self.current_seq_len)
         
-        while len(sequences) < self.batch_size:
-            start = np.random.randint(0, self.size)
-            if start + self.current_seq_len > self.size:
-                continue
+        while True:    
+            sequences = []
+            attempts = 0
+        
+            while len(sequences) < self.batch_size:
+                attempts += 1
+
+                if attempts % 10000 == 0:
+                    print(
+                        f"[ReplayBuffer] attempts={attempts}, "
+                        f"success={len(sequences)}/{self.batch_size}, "
+                        f"seq_len={self.current_seq_len}, "
+                        f"buffer_size={self.size}"
+                    )
+                start = np.random.randint(0, self.size)
+                if start + self.current_seq_len > self.size:
+                    continue
             
-            agent_id = self.agent_id[start]
-            episode_id = self.episode_id[start]
+                agent_id = self.agent_id[start]
+                episode_id = self.episode_id[start]
             
-            indices = np.where((self.agent_id == agent_id) & (self.episode_id == episode_id))[0]               
-            start_pos = np.where(indices == start)[0][0]
-            if start_pos + self.current_seq_len > len(indices):
-                continue
+                indices = np.where((self.agent_id[:self.size] == agent_id) & (self.episode_id[:self.size] == episode_id))[0]               
+                start_pos = np.where(indices == start)[0][0]
+                if start_pos + self.current_seq_len > len(indices):
+                    self.current_seq_len = max(1, self.current_seq_len - 1)
+                    break
                 
-            seq_indices = indices[start_pos:start_pos + self.current_seq_len]
-            if np.any(self.done[seq_indices[:-1]]):
-                continue
+                seq_indices = indices[start_pos:start_pos + self.current_seq_len]
+                if np.any(self.done[seq_indices[:-1]]):
+                    continue
                 
-            sequences.append(seq_indices)
+                sequences.append(seq_indices)
+                
+            if len(sequences) == self.batch_size:
+                break
             
         indices = np.stack(sequences)
         
