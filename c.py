@@ -177,15 +177,16 @@ class Actor(nn.Module):
         
 
 class Critic(nn.Module):
-    def __init__(self, state_dim, hidden_dim=256):
+    def __init__(self, hidden_dim=256, latent_dim=32):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim + latent_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.value = nn.Linear(hidden_dim, 1)
         
-    def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+    def forward(self, memory, latent):
+        x = torch.cat([memory, latent], dim=-1)
+        x = F.elu(self.fc1(x))
+        x = F.elu(self.fc2(x))
         value = self.value(x)
         return value
         
@@ -193,7 +194,7 @@ class Critic(nn.Module):
 class Agent:
     def __init__(self, state_dim, action_dim, lr=3e-4):
         self.actor = Actor(state_dim, action_dim)
-        self.critic = Critic(state_dim)
+        self.critic = Critic()
         self.world_model = WorldModel(state_dim, action_dim)
         
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
@@ -202,34 +203,49 @@ class Agent:
         
     def update_world_model(self, state, action, next_state, reward):
         memories, posterior_latents, posterior_dists, prior_dists = self.world_model(state, action, reward, next_state)
-            
-            
-            
-            
-            
-            
-            
-            
         
-    def imagine(self, state, horizon=15):
+        total_loss = 0
+        recon_loss = 0
+        reward_loss = 0
+        dist_loss = 0
+        
+        for t in range(state.shape[1]):
+            t_loss, rec_loss, rew_loss, d_loss = self.world_model.loss(memories[:, t, :], posterior_latents[:, t, :], next_state[:, t, :], reward[:, t, :], posterior_dists[t], prior_dists[t])    
+            total_loss += t_loss
+            recon_loss += rec_loss
+            reward_loss += rew_loss
+            dist_loss += d_loss
+            
+        total_loss /= state.shape[1]
+        recon_loss /= state.shape[1]
+        reward_loss /= state.shape[1]
+        dist_loss /= state.shape[1]
+        
+        memory = memories[:, -1, :]
+        latent = posterior_latents[:, -1, :]
+        
+        return total_loss, recon_loss, reward_loss, dist_loss, memory, latent            
+        
+    def imagine_with_AC(self, state, latent, memory, horizon=15):
         imagined_states = []
         imagined_actions = []
         imagined_rewards = []
         imagined_next_states = []
-        imagined_values = []
         imagined_next_values = []
         
         for _ in range(horizon):
             action, _ = self.actor.sample(state)
-            pred_next_state, pred_reward = self.world_model(state, action)
-            value = self.critic(state)
-            next_value = self.critic(pred_next_state)            
+            memory, latent = self.world_model.rssm.imagine(latent, action, memory)
+            
+            pred_next_state = self.world_model.decoder(memory, latent)
+            pred_reward = self.world_model.reward_model(memory, latent)
+            
+            next_value = self.critic(memory, latent)
             
             imagined_states.append(state)
             imagined_actions.append(action)
             imagined_rewards.append(pred_reward)
             imagined_next_states.append(pred_next_state)
-            imagined_values.append(value)
             imagined_next_values.append(next_value)
 
             state = pred_next_state
@@ -238,10 +254,9 @@ class Agent:
         imagined_actions = torch.stack(imagined_actions, dim=1)
         imagined_rewards = torch.stack(imagined_rewards, dim=1)
         imagined_next_states = torch.stack(imagined_next_states, dim=1)
-        imagined_values = torch.stack(imagined_values, dim=1)
         imagined_next_values = torch.stack(imagined_next_values, dim=1)
         
-        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_values, imagined_next_values
+        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_next_values
         
     def compute_return(self, rewards, next_values, gamma=0.99, lambda_=0.95):
         B, H, _ = rewards.shape
@@ -255,7 +270,7 @@ class Agent:
         return returns               
     
     def critic_loss(self, values, returns):
-        critic_loss = F.mse_loss(values, returns.detach())     
+        critic_loss = F.mse_loss(values, returns)     
         return critic_loss
         
     def actor_loss(self, returns):          
@@ -271,7 +286,7 @@ class Agent:
 
         #==========================================
         
-        world_model_loss, recon_loss, reward_loss = self.update_world_model(state, action, next_state, reward)
+        world_model_loss, recon_loss, reward_loss, dist_loss, memory, latent = self.update_world_model(state, action, next_state, reward)
         self.world_model_optimizer.zero_grad()
         world_model_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
@@ -284,13 +299,11 @@ class Agent:
         for p in self.actor.parameters():
             p.requires_grad = False 
         
-        with torch.no_grad():
-            imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_values, imagined_next_values = self.imagine(state[:, -1, :])
+        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_next_values = self.imagine_with_AC(state[:, -1, :], latent.detach(), memory.detach())
+        with torch.no_grad():    
             returns = self.compute_return(imagined_rewards, imagined_next_values)
         
-        imagined_values = self.critic(imagined_states)
-        
-        critic_loss = self.critic_loss(imagined_values, returns)        
+        critic_loss = self.critic_loss(imagined_next_values[:, :-1, :], returns[:, 1:, :])        
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
@@ -308,7 +321,7 @@ class Agent:
         for p in self.critic.parameters():
             p.requires_grad = False      
         
-        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_values, imagined_next_values = self.imagine(state[:, -1, :])
+        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_next_values = self.imagine_with_AC(state[:, -1, :], latent.detach(), memory.detach())
         returns = self.compute_return(imagined_rewards, imagined_next_values)
         
         actor_loss = self.actor_loss(returns)        
@@ -330,7 +343,7 @@ class Agent:
         
         
 class ReplayBuffer:
-    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=50, max_seq_len=50):
+    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=1, max_seq_len=50):
         self.max_size = max_size
         self.batch_size = batch_size
         self.current_seq_len = 1
@@ -342,8 +355,7 @@ class ReplayBuffer:
         self.next_state = np.zeros((max_size, state_dim), dtype=np.float32)
         self.action = np.zeros((max_size, action_dim), dtype=np.float32)
         self.reward = np.zeros((max_size, 1), dtype=np.float32)
-        self.done = np.zeros((max_size, 1), dtype=np.float32)
-        
+        self.done = np.zeros((max_size, 1), dtype=np.float32)      
         self.agent_id = np.zeros(max_size, dtype=np.int64)
         self.episode_id = np.zeros(max_size, dtype=np.int64)
 
@@ -352,8 +364,7 @@ class ReplayBuffer:
         self.action[self.ptr] = action
         self.reward[self.ptr] = reward
         self.next_state[self.ptr] = next_state
-        self.done[self.ptr] = done
-        
+        self.done[self.ptr] = done       
         self.agent_id[self.ptr] = agent_id
         self.episode_id[self.ptr] = episode_id
 
@@ -385,7 +396,7 @@ class ReplayBuffer:
         if self.current_seq_len < self.max_seq_len:
             self.current_seq_len = self.update_seq_len()
             
-        print(self.current_seq_len)
+        #print(self.current_seq_len)
         
         while True:    
             sequences = []
@@ -394,13 +405,13 @@ class ReplayBuffer:
             while len(sequences) < self.batch_size:
                 attempts += 1
 
-                if attempts % 10000 == 0:
-                    print(
-                        f"[ReplayBuffer] attempts={attempts}, "
-                        f"success={len(sequences)}/{self.batch_size}, "
-                        f"seq_len={self.current_seq_len}, "
-                        f"buffer_size={self.size}"
-                    )
+                #if attempts % 10000 == 0:
+                #    print(
+                #        f"[ReplayBuffer] attempts={attempts}, "
+                #        f"success={len(sequences)}/{self.batch_size}, "
+                #        f"seq_len={self.current_seq_len}, "
+                #        f"buffer_size={self.size}"
+                #    )
                 start = np.random.randint(0, self.size)
                 if start + self.current_seq_len > self.size:
                     continue
