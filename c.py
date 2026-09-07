@@ -83,7 +83,7 @@ class RewardModel(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim):
         super().__init__()
         self.rssm = RSSM(state_dim, action_dim)
         self.decoder = Decoder(state_dim)
@@ -111,35 +111,6 @@ class WorldModel(nn.Module):
         
         return total_loss, recon_loss, reward_loss, dist_loss
         
-    def forward(self, states, actions, rewards, next_states):
-        states = torch.as_tensor(states, dtype=torch.float32)
-        actions = torch.as_tensor(actions, dtype=torch.float32)
-        rewards = torch.as_tensor(rewards, dtype=torch.float32)
-        next_states = torch.as_tensor(next_states, dtype=torch.float32)
-    
-        B = states.shape[0]
-        memory = torch.zeros(B, self.rssm.gru.hidden_size)
-        latent = torch.zeros(B, self.rssm.prior_mean.out_features)
-        
-        memories = []
-        posterior_latents = []
-        posterior_dists = []
-        prior_dists = []
-        
-        for t in range(states.shape[1]):
-            memory, posterior_dist, posterior_latent, prior_dist, prior_latent = self.rssm.observe(latent, actions[:, t], memory, next_states[:, t])
-            
-            memories.append(memory)
-            posterior_latents.append(posterior_latent)
-            posterior_dists.append(posterior_dist)
-            prior_dists.append(prior_dist)
-            
-            latent = posterior_latent
-            
-        memories = torch.stack(memories, dim=1)
-        posterior_latents = torch.stack(posterior_latents, dim=1)
-            
-        return memories, posterior_latents, posterior_dists, prior_dists
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
@@ -201,25 +172,45 @@ class Agent:
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
         self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr)
         
-    def update_world_model(self, state, action, next_state, reward):
-        memories, posterior_latents, posterior_dists, prior_dists = self.world_model(state, action, reward, next_state)
+    def update_world_model(self, states, actions, next_states, rewards):        
+        B, T, _ = states.shape
+        memory = torch.zeros(B, self.world_model.rssm.gru.hidden_size)
+        latent = torch.zeros(B, self.world_model.rssm.prior_mean.out_features)
+        
+        memories = []
+        posterior_latents = []
+        posterior_dists = []
+        prior_dists = []
+        
+        for t in range(T):
+            memory, posterior_dist, posterior_latent, prior_dist, _ = self.world_model.rssm.observe(latent, actions[:, t, :], memory, next_states[:, t, :])
+            
+            memories.append(memory)
+            posterior_latents.append(posterior_latent)
+            posterior_dists.append(posterior_dist)
+            prior_dists.append(prior_dist)
+            
+            latent = posterior_latent
+            
+        memories = torch.stack(memories, dim=1)
+        posterior_latents = torch.stack(posterior_latents, dim=1)
         
         total_loss = 0
         recon_loss = 0
         reward_loss = 0
         dist_loss = 0
         
-        for t in range(state.shape[1]):
-            t_loss, rec_loss, rew_loss, d_loss = self.world_model.loss(memories[:, t, :], posterior_latents[:, t, :], next_state[:, t, :], reward[:, t, :], posterior_dists[t], prior_dists[t])    
+        for t in range(T):
+            t_loss, rec_loss, rew_loss, d_loss = self.world_model.loss(memories[:, t, :], posterior_latents[:, t, :], next_states[:, t, :], rewards[:, t, :], posterior_dists[t], prior_dists[t])    
             total_loss += t_loss
             recon_loss += rec_loss
             reward_loss += rew_loss
             dist_loss += d_loss
             
-        total_loss /= state.shape[1]
-        recon_loss /= state.shape[1]
-        reward_loss /= state.shape[1]
-        dist_loss /= state.shape[1]
+        total_loss /= T
+        recon_loss /= T
+        reward_loss /= T
+        dist_loss /= T
         
         memory = memories[:, -1, :]
         latent = posterior_latents[:, -1, :]
@@ -232,14 +223,14 @@ class Agent:
         imagined_rewards = []
         imagined_next_states = []
         imagined_next_values = []
+        imagined_log_probs = []
         
         for _ in range(horizon):
-            action, _ = self.actor.sample(state)
+            action, log_prob = self.actor.sample(state)
             memory, latent = self.world_model.rssm.imagine(latent, action, memory)
             
             pred_next_state = self.world_model.decoder(memory, latent)
-            pred_reward = self.world_model.reward_model(memory, latent)
-            
+            pred_reward = self.world_model.reward_model(memory, latent)           
             next_value = self.critic(memory, latent)
             
             imagined_states.append(state)
@@ -247,6 +238,7 @@ class Agent:
             imagined_rewards.append(pred_reward)
             imagined_next_states.append(pred_next_state)
             imagined_next_values.append(next_value)
+            imagined_log_probs.append(log_prob)
 
             state = pred_next_state
             
@@ -255,8 +247,9 @@ class Agent:
         imagined_rewards = torch.stack(imagined_rewards, dim=1)
         imagined_next_states = torch.stack(imagined_next_states, dim=1)
         imagined_next_values = torch.stack(imagined_next_values, dim=1)
+        imagined_log_probs = torch.stack(imagined_log_probs, dim=1)
         
-        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_next_values
+        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_next_values, imagined_log_probs
         
     def compute_return(self, rewards, next_values, gamma=0.99, lambda_=0.95):
         B, H, _ = rewards.shape
@@ -273,20 +266,20 @@ class Agent:
         critic_loss = F.mse_loss(values, returns)     
         return critic_loss
         
-    def actor_loss(self, returns):          
-        actor_loss = -returns.mean()       
+    def actor_loss(self, returns, imagined_log_probs, alpha=0.01):          
+        actor_loss = -returns.mean() + alpha * imagined_log_probs.mean()      
         return actor_loss
 
     def update(self, batch):
-        state = torch.FloatTensor(batch['state'])
-        action = torch.FloatTensor(batch['action'])
-        reward = torch.FloatTensor(batch['reward'])
-        next_state = torch.FloatTensor(batch['next_state'])
-        done = torch.FloatTensor(batch['done'])
+        states = torch.from_numpy(batch['state'])
+        actions = torch.from_numpy(batch['action'])
+        rewards = torch.from_numpy(batch['reward'])
+        next_states = torch.from_numpy(batch['next_state'])
+        dones = torch.from_numpy(batch['done'])
 
         #==========================================
         
-        world_model_loss, recon_loss, reward_loss, dist_loss, memory, latent = self.update_world_model(state, action, next_state, reward)
+        world_model_loss, recon_loss, reward_loss, dist_loss, memory, latent = self.update_world_model(states, actions, next_states, rewards)
         self.world_model_optimizer.zero_grad()
         world_model_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
@@ -299,7 +292,7 @@ class Agent:
         for p in self.actor.parameters():
             p.requires_grad = False 
         
-        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_next_values = self.imagine_with_AC(state[:, -1, :], latent.detach(), memory.detach())
+        _, _, imagined_rewards, _, imagined_next_values, imagined_log_probs = self.imagine_with_AC(states[:, -1, :], latent.detach(), memory.detach())
         with torch.no_grad():    
             returns = self.compute_return(imagined_rewards, imagined_next_values)
         
@@ -321,10 +314,10 @@ class Agent:
         for p in self.critic.parameters():
             p.requires_grad = False      
         
-        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_next_values = self.imagine_with_AC(state[:, -1, :], latent.detach(), memory.detach())
+        _, _, imagined_rewards, _, imagined_next_values, imagined_log_probs = self.imagine_with_AC(states[:, -1, :], latent.detach(), memory.detach())
         returns = self.compute_return(imagined_rewards, imagined_next_values)
         
-        actor_loss = self.actor_loss(returns)        
+        actor_loss = self.actor_loss(returns, imagined_log_probs)        
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
@@ -336,14 +329,17 @@ class Agent:
             p.requires_grad = True
         
         return {
-            "world_model_loss": world_model_loss.item(),
-            "recon_loss": recon_loss.item(),
-            "reward_loss": reward_loss.item(),          
+            "world_model_total_loss": world_model_loss.item(),
+            "world_model_recon_loss": recon_loss.item(),
+            "world_model_reward_loss": reward_loss.item(),
+            "world_model_distribution_loss": dist_loss.item(),
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),          
         }
         
         
 class ReplayBuffer:
-    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=1, max_seq_len=50):
+    def __init__(self, state_dim, action_dim, max_size=int(1e6), batch_size=24, max_seq_len=50):
         self.max_size = max_size
         self.batch_size = batch_size
         self.current_seq_len = 1
@@ -395,23 +391,11 @@ class ReplayBuffer:
     def sample(self):
         if self.current_seq_len < self.max_seq_len:
             self.current_seq_len = self.update_seq_len()
-            
-        #print(self.current_seq_len)
         
         while True:    
             sequences = []
-            attempts = 0
         
             while len(sequences) < self.batch_size:
-                attempts += 1
-
-                #if attempts % 10000 == 0:
-                #    print(
-                #        f"[ReplayBuffer] attempts={attempts}, "
-                #        f"success={len(sequences)}/{self.batch_size}, "
-                #        f"seq_len={self.current_seq_len}, "
-                #        f"buffer_size={self.size}"
-                #    )
                 start = np.random.randint(0, self.size)
                 if start + self.current_seq_len > self.size:
                     continue
@@ -569,7 +553,7 @@ if __name__ == "__main__":
                              test_rewards[i] += t_decision_steps.reward[j]
                              
                  test_average_reward = np.mean(test_rewards)
-                 writer.add_scalar("Test/Average_Reward", test_average_reward, update_count)
+                 writer.add_scalar("Test/average_reward", test_average_reward, update_count)
                  print(f"{test_average_reward:.4f}")
                  torch.save(agent.actor.state_dict(), f"{BASE_DIR}/period_model.pth")
                  #save_checkpoint(f"{BASE_DIR}/checkpoint.pth", agent, buffer)                    
