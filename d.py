@@ -101,13 +101,7 @@ class WorldModel(nn.Module):
         #==========================================
         
         next_state_loss = F.mse_loss(posterior_next_state, next_state)
-        
-        #==========================================
-       
-        reward_loss = F.mse_loss(pred_reward, reward)
-        
-        #==========================================
-        
+        reward_loss = F.mse_loss(pred_reward, reward)        
         continue_loss = F.binary_cross_entropy_with_logits(pred_continue_logit, continuation)
         
         #==========================================
@@ -164,14 +158,16 @@ class Actor(nn.Module):
         mean, log_std = self.forward(state)
         std = log_std.exp()        
         dist = torch.distributions.Normal(mean, std)
-        raw_action = dist.rsample()
+        raw_action = dist.sample()
         action = torch.tanh(raw_action)
 
         log_prob = dist.log_prob(raw_action)
         log_prob = log_prob - torch.log(1 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
+        
+        entropy = dist.entropy().sum(dim=-1, keepdim=True)
 
-        return action, log_prob
+        return action, log_prob, entropy
         
     def deterministic(self, state):
         mean, _ = self.forward(state)
@@ -204,7 +200,6 @@ class Agent(nn.Module):
 
         self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr)        
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)        
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
         
         #==========================================
         ### Load Actor (fc1, fc2, mean) ###
@@ -220,6 +215,8 @@ class Agent(nn.Module):
         
         #==========================================
         
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        
     def imagine(self, state, horizon=5):
         imagined_states = []
         imagined_actions = []
@@ -227,9 +224,10 @@ class Agent(nn.Module):
         imagined_next_states = []
         imagined_continuations = []
         imagined_log_probs = []
+        imagined_entropies = []
         
         for t in range(horizon):
-            action, log_prob = self.actor.sample(state)
+            action, log_prob, entropy = self.actor.sample(state)
             
             next_state = self.world_model.next_state_model.imagine(state, action) 
             reward = self.world_model.reward_model(state, action)
@@ -242,6 +240,7 @@ class Agent(nn.Module):
             imagined_next_states.append(next_state)
             imagined_continuations.append(continuation)
             imagined_log_probs.append(log_prob)
+            imagined_entropies.append(entropy)
             
             state = next_state
         
@@ -251,8 +250,9 @@ class Agent(nn.Module):
         imagined_next_states = torch.stack(imagined_next_states, dim=1)
         imagined_continuations = torch.stack(imagined_continuations, dim=1)
         imagined_log_probs = torch.stack(imagined_log_probs, dim=1)
+        imagined_entropies = torch.stack(imagined_entropies, dim=1)
        
-        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs
+        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs, imagined_entropies
     
     def compute_return(self, rewards, next_values, continuations, gamma=0.99, lambda_=0.95):
         B, H, _ = rewards.shape
@@ -287,7 +287,7 @@ class Agent(nn.Module):
             "dist_loss": dist_loss.item(),
         }
         
-    def update(self, batch):
+    def update(self, batch, eta=3e-4):
         state = torch.FloatTensor(batch['state'])
         action = torch.FloatTensor(batch['action'])
         reward = torch.FloatTensor(batch['reward'])
@@ -302,7 +302,7 @@ class Agent(nn.Module):
         for p in self.actor.parameters():
             p.requires_grad = False 
             
-        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs = self.imagine(state)
+        imagined_states, _, imagined_rewards, imagined_next_states, imagined_continuations, _, _ = self.imagine(state)
         imagined_values = self.critic(imagined_states)
         with torch.no_grad():
             imagined_next_values = self.critic(imagined_next_states)
@@ -326,11 +326,18 @@ class Agent(nn.Module):
         for p in self.critic.parameters():
             p.requires_grad = False  
             
-        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs = self.imagine(state)
-        imagined_next_values = self.critic(imagined_next_states)
-        returns = self.compute_return(imagined_rewards, imagined_next_values, imagined_continuations)
-        
-        actor_loss = -returns.mean() + 0.01 * imagined_log_probs.mean()        
+        imagined_states, _, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs, imagined_entropies = self.imagine(state)
+        with torch.no_grad():
+            imagined_next_values = self.critic(imagined_next_states)
+            returns = self.compute_return(imagined_rewards, imagined_next_values, imagined_continuations)
+            return_spread = torch.quantile(returns, 0.95) - torch.quantile(returns, 0.05)
+            return_spread = torch.clamp(return_spread, min=1.0)
+                       
+            imagined_values = self.critic(imagined_states)
+            advantages = returns - imagined_values
+            advantages = advantages / return_spread
+
+        actor_loss = -(advantages * imagined_log_probs).mean() - eta * imagined_entropies.mean()              
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
@@ -425,7 +432,7 @@ if __name__ == "__main__":
                 actions = np.random.uniform(low=-1.0, high=1.0, size=(len(agent_ids), action_dim)).astype(np.float32)
             else:
                 with torch.no_grad():
-                    actions, _ = agent.actor.sample(states_tensor)   
+                    actions, _, _ = agent.actor.sample(states_tensor)   
                 actions = actions.cpu().numpy().astype(np.float32)
                 
             env.set_actions(behavior_name, ActionTuple(continuous=actions))
