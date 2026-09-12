@@ -11,6 +11,48 @@ from torch.utils.tensorboard import SummaryWriter
 BASE_DIR = ""
 
 
+class NextStateModel(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=256):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.posterior_mean = nn.Linear(hidden_dim + state_dim, state_dim)
+        self.posterior_log_std = nn.Linear(hidden_dim + state_dim, state_dim)
+        self.prior_mean = nn.Linear(hidden_dim, state_dim)
+        self.prior_log_std = nn.Linear(hidden_dim, state_dim)
+    
+    def observe(self, state, action, next_state):
+        x = torch.cat([state, action], dim=-1)
+        x = F.elu(self.fc1(x))
+        x = F.elu(self.fc2(x))
+        
+        posterior_input = torch.cat([x, next_state], dim=-1)               
+        posterior_mean = self.posterior_mean(posterior_input)
+        posterior_log_std = torch.clamp(self.posterior_log_std(posterior_input), -5, 2)
+        posterior_std = torch.exp(posterior_log_std)
+        posterior_dist = torch.distributions.Normal(posterior_mean, posterior_std)
+        posterior_next_state = posterior_dist.rsample()
+
+        prior_mean = self.prior_mean(x)
+        prior_log_std = torch.clamp(self.prior_log_std(x), -5, 2)
+        prior_std = torch.exp(prior_log_std)
+        prior_dist = torch.distributions.Normal(prior_mean, prior_std)
+        prior_next_state = prior_dist.rsample()      
+                
+        return posterior_dist, posterior_next_state, prior_dist, prior_next_state
+        
+    def imagine(self, state, action):
+        x = torch.cat([state, action], dim=-1)
+        x = F.elu(self.fc1(x))
+        x = F.elu(self.fc2(x))
+        prior_mean = self.prior_mean(x)
+        prior_log_std = torch.clamp(self.prior_log_std(x), -5, 2)
+        prior_std = torch.exp(prior_log_std)
+        prior_dist = torch.distributions.Normal(prior_mean, prior_std)
+        prior_next_state = prior_dist.rsample()         
+        return prior_next_state          
+        
+
 class RewardModel(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
@@ -47,33 +89,58 @@ class ContinueModel(nn.Module):
 class WorldModel(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.next_state = nn.Linear(hidden_dim, state_dim)
+        self.next_state_model = NextStateModel(state_dim, action_dim)        
         self.reward_model = RewardModel(state_dim, action_dim)
-        self.continue_model = ContinueModel(state_dim, action_dim)
-        
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        x = F.elu(self.fc1(x))
-        x = F.elu(self.fc2(x))       
-        next_state = self.next_state(x)
-        
-        reward = self.reward_model(state, action)
-        continue_logit = self.continue_model(state, action)
-        
-        return next_state, reward, continue_logit
-        
+        self.continue_model = ContinueModel(state_dim, action_dim)    
+    
     def loss(self, state, action, next_state, reward, continuation):
-        pred_next_state, pred_reward, pred_continue_logit = self.forward(state, action)
-
-        next_state_loss = F.mse_loss(pred_next_state, next_state)
+        posterior_dist, posterior_next_state, prior_dist, prior_next_state = self.next_state_model.observe(state, action, next_state)
+        pred_reward = self.reward_model(state, action)
+        pred_continue_logit = self.continue_model(state, action)
+        
+        #==========================================
+        
+        next_state_loss = F.mse_loss(posterior_next_state, next_state)
+        
+        #==========================================
+       
         reward_loss = F.mse_loss(pred_reward, reward)
+        
+        #==========================================
+        
         continue_loss = F.binary_cross_entropy_with_logits(pred_continue_logit, continuation)
-
-        total_loss = next_state_loss + reward_loss + continue_loss
-
-        return total_loss, next_state_loss, reward_loss, continue_loss
+        
+        #==========================================
+        
+        posterior_dist_detached = torch.distributions.Normal(
+            posterior_dist.loc.detach(),
+            posterior_dist.scale.detach()
+        )
+        
+        prior_dist_detached = torch.distributions.Normal(
+            prior_dist.loc.detach(),
+            prior_dist.scale.detach()
+        )
+        
+        dyn_loss = torch.distributions.kl_divergence(
+            posterior_dist_detached,
+            prior_dist
+        ).mean()
+        
+        rep_loss = torch.distributions.kl_divergence(
+            posterior_dist,
+            prior_dist_detached
+        ).mean()
+        
+        dyn_loss = torch.clamp(dyn_loss, min=1.0)
+        rep_loss = torch.clamp(rep_loss, min=1.0)
+        
+        dist_loss = dyn_loss + 0.1 * rep_loss 
+        
+        #==========================================
+        
+        total_loss = next_state_loss + reward_loss + continue_loss + dist_loss
+        return total_loss, next_state_loss, reward_loss, continue_loss, dist_loss
 
         
 class Actor(nn.Module):
@@ -112,36 +179,35 @@ class Actor(nn.Module):
         
 
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, hidden_dim=256):
         super().__init__()
-        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.q = nn.Linear(hidden_dim, 1)
+        self.value = nn.Linear(hidden_dim, 1)
         
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        x = F.relu(self.fc1(x))
+        nn.init.zeros_(self.value.weight)
+        nn.init.zeros_(self.value.bias)
+        
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
         x = F.relu(self.fc2(x))
-        q = self.q(x)
-        return q
+        value = self.value(x)
+        return value
         
         
-class SACAgent:
+class Agent(nn.Module):
     def __init__(self, state_dim, action_dim, lr=3e-4):
-        self.actor = Actor(state_dim, action_dim)
-        self.critic1 = Critic(state_dim, action_dim)
-        self.critic2 = Critic(state_dim, action_dim)
-        self.critic1_target = Critic(state_dim, action_dim)
-        self.critic2_target = Critic(state_dim, action_dim)
-        self.critic1_target.load_state_dict(self.critic1.state_dict())
-        self.critic2_target.load_state_dict(self.critic2.state_dict())
-        
+        super().__init__()
         self.world_model = WorldModel(state_dim, action_dim)
+        self.critic = Critic(state_dim)
+        self.actor = Actor(state_dim, action_dim)
+
+        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr)        
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)        
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
         
-        ###########################################
+        #==========================================
         ### Load Actor (fc1, fc2, mean) ###
-        # Set random_exploration_steps to 0, learning_starts to the minimum
-        ###########################################
         
         state_dict = torch.load(f"{BASE_DIR}/previous_model.pth")
         self.actor.fc1.load_state_dict({"weight": state_dict["fc1.weight"], "bias": state_dict["fc1.bias"]})
@@ -151,40 +217,31 @@ class SACAgent:
         with torch.no_grad():        
             self.actor.log_std.weight.zero_()
             self.actor.log_std.bias.fill_(-2)        
-        self.log_alpha = nn.Parameter(torch.tensor([-9.0]))
         
         #==========================================
         
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
-        self.critic1_optimizer = torch.optim.Adam(self.critic1.parameters(), lr=lr)
-        self.critic2_optimizer = torch.optim.Adam(self.critic2.parameters(), lr=lr)
-        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr)
-
-        #self.log_alpha = nn.Parameter(torch.zeros(1))
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
-        
-        self.target_entropy = -action_dim
-        self.gamma = 0.99
-        self.tau = 0.005
-        
-    def imagine(self, state, horizon=1):
+    def imagine(self, state, horizon=5):
         imagined_states = []
         imagined_actions = []
         imagined_rewards = []
         imagined_next_states = []
         imagined_continuations = []
+        imagined_log_probs = []
         
         for t in range(horizon):
-            action, _ = self.actor.sample(state)
+            action, log_prob = self.actor.sample(state)
             
-            next_state, reward, continue_logit = self.world_model(state, action) 
-            continuation = torch.sigmoid(continue_logit) 
+            next_state = self.world_model.next_state_model.imagine(state, action) 
+            reward = self.world_model.reward_model(state, action)
+            continue_logit = self.world_model.continue_model(state, action)
+            continuation = torch.sigmoid(continue_logit)          
             
             imagined_states.append(state)
             imagined_actions.append(action)
             imagined_rewards.append(reward)
             imagined_next_states.append(next_state)
             imagined_continuations.append(continuation)
+            imagined_log_probs.append(log_prob)
             
             state = next_state
         
@@ -193,15 +250,20 @@ class SACAgent:
         imagined_rewards = torch.stack(imagined_rewards, dim=1)
         imagined_next_states = torch.stack(imagined_next_states, dim=1)
         imagined_continuations = torch.stack(imagined_continuations, dim=1)
+        imagined_log_probs = torch.stack(imagined_log_probs, dim=1)
        
-        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations
+        return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs
     
-    def update_target(self, net, target_net):
-        with torch.no_grad():
-            for param, target_param in zip(net.parameters(), target_net.parameters()):
-                target_param.copy_(
-                    self.tau * param + (1 - self.tau) * target_param
-                )
+    def compute_return(self, rewards, next_values, continuations, gamma=0.99, lambda_=0.95):
+        B, H, _ = rewards.shape
+        returns = torch.zeros_like(rewards)
+        next_returns = next_values[:, -1, :]
+        
+        for t in reversed(range(H)):    
+            next_returns = rewards[:, t, :] + gamma * continuations[:, t, :] * ((1 - lambda_) * next_values[:, t, :] + lambda_ * next_returns)            
+            returns[:, t, :] = next_returns
+            
+        return returns  
                 
     def world_model_update(self, batch):
         state = torch.FloatTensor(batch['state'])
@@ -211,12 +273,20 @@ class SACAgent:
         done = torch.FloatTensor(batch['done'])
         continuation = 1.0 - done
         
-        world_model_loss, next_state_loss, reward_loss, continue_loss = self.world_model.loss(state, action, next_state, reward, continuation)
+        world_model_loss, next_state_loss, reward_loss, continue_loss, dist_loss = self.world_model.loss(state, action, next_state, reward, continuation)
         self.world_model_optimizer.zero_grad()
         world_model_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
         self.world_model_optimizer.step()       
-
+        
+        return {
+            "world_model_loss": world_model_loss.item(),
+            "next_state_loss": next_state_loss.item(),
+            "reward_loss": reward_loss.item(),
+            "continue_loss": continue_loss.item(),
+            "dist_loss": dist_loss.item(),
+        }
+        
     def update(self, batch):
         state = torch.FloatTensor(batch['state'])
         action = torch.FloatTensor(batch['action'])
@@ -227,87 +297,52 @@ class SACAgent:
         
         #==========================================
         
-        world_model_loss, next_state_loss, reward_loss, continue_loss = self.world_model.loss(state, action, next_state, reward, continuation)
-        self.world_model_optimizer.zero_grad()
-        world_model_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
-        self.world_model_optimizer.step()
-        
-        #==========================================
-        
+        for p in self.world_model.parameters():
+            p.requires_grad = False 
+        for p in self.actor.parameters():
+            p.requires_grad = False 
+            
+        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs = self.imagine(state)
+        imagined_values = self.critic(imagined_states)
         with torch.no_grad():
-            imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations = self.imagine(state)
-            next_action, next_log_prob = self.actor.sample(imagined_next_states)
-            
-            next_q1 = self.critic1_target(imagined_next_states, next_action)
-            next_q2 = self.critic2_target(imagined_next_states, next_action)
-            next_q = torch.min(next_q1, next_q2)
-            
-            alpha = self.log_alpha.exp()            
-            target_q = imagined_rewards + self.gamma * imagined_continuations * (next_q - alpha * next_log_prob)
-            
-        q1 = self.critic1(imagined_states, imagined_actions)
-        q2 = self.critic2(imagined_states, imagined_actions)
+            imagined_next_values = self.critic(imagined_next_states)
+            returns = self.compute_return(imagined_rewards, imagined_next_values, imagined_continuations)
         
-        critic1_loss = F.mse_loss(q1, target_q)
-        critic2_loss = F.mse_loss(q2, target_q)
+        critic_loss = F.mse_loss(imagined_values, returns)        
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.critic_optimizer.step()
         
-        self.critic1_optimizer.zero_grad()
-        critic1_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 1.0)
-        self.critic1_optimizer.step()
+        for p in self.world_model.parameters():
+            p.requires_grad = True 
+        for p in self.actor.parameters():
+            p.requires_grad = True 
         
-        self.critic2_optimizer.zero_grad()
-        critic2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 1.0)
-        self.critic2_optimizer.step()
+        #==========================================        
         
-        #==========================================
-        
-        for p in self.critic1.parameters():
+        for p in self.world_model.parameters():
             p.requires_grad = False
-        for p in self.critic2.parameters():
-            p.requires_grad = False
+        for p in self.critic.parameters():
+            p.requires_grad = False  
+            
+        imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs = self.imagine(state)
+        imagined_next_values = self.critic(imagined_next_states)
+        returns = self.compute_return(imagined_rewards, imagined_next_values, imagined_continuations)
         
-        action_new, log_prob = self.actor.sample(state)
-        
-        q1_new = self.critic1(state, action_new)
-        q2_new = self.critic2(state, action_new)
-        q_new = torch.min(q1_new, q2_new)
-        
-        alpha = self.log_alpha.exp().detach()    
-        actor_loss = -(q_new - alpha * log_prob).mean()
-        
+        actor_loss = -returns.mean() + 0.01 * imagined_log_probs.mean()        
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
         
-        for p in self.critic1.parameters():
+        for p in self.world_model.parameters():
             p.requires_grad = True
-        for p in self.critic2.parameters():
-            p.requires_grad = True
-        
-        #==========================================
-
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
-
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
-        
-        #==========================================
-        
-        self.update_target(self.critic1, self.critic1_target)
-        self.update_target(self.critic2, self.critic2_target)
+        for p in self.critic.parameters():
+            p.requires_grad = True        
 
         return {
-            "world_model_loss": world_model_loss.item(),
-            "next_state_loss": next_state_loss.item(),
-            "reward_loss": reward_loss.item(),
-            "continue_loss": continue_loss.item(),
-            "critic1_loss": critic1_loss.item(),
-            "critic2_loss": critic2_loss.item(),
-            "alpha": self.log_alpha.exp().item(),
+            "critic_loss": critic_loss.item(),
+            "actor_loss": actor_loss.item(),
         }
         
         
@@ -361,7 +396,7 @@ if __name__ == "__main__":
     spec = env.behavior_specs[behavior_name]
     state_dim = spec.observation_specs[0].shape[0]
     action_dim = spec.action_spec.continuous_size
-    agent = SACAgent(state_dim, action_dim)
+    agent = Agent(state_dim, action_dim)
     buffer = ReplayBuffer(state_dim, action_dim)
     writer = SummaryWriter(log_dir=BASE_DIR)
     
@@ -418,13 +453,15 @@ if __name__ == "__main__":
         
         if total_steps >= learning_starts:
             batch = buffer.sample()
-            agent.world_model_update(batch)
+            wm_metrics = agent.world_model_update(batch)
             world_model_steps += 1
 
-            if world_model_steps >= 5000:
+            if world_model_steps >= 10000:
                 batch = buffer.sample()
                 metrics = agent.update(batch) 
-                update_count += 1           
+                update_count += 1
+                for k, v in wm_metrics.items():
+                    writer.add_scalar(f"Train/{k}", v, update_count)            
                 for k, v in metrics.items():
                     writer.add_scalar(f"Train/{k}", v, update_count)               
              
