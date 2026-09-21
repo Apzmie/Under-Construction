@@ -11,11 +11,61 @@ from torch.utils.tensorboard import SummaryWriter
 BASE_DIR = ""
 
 
+class RMSNorm(nn.Module):
+    """without learnable parameters"""
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        rms = torch.sqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return x / rms
+        
+        
+class LaProp(torch.optim.Optimizer):
+    def __init__(self, params, lr, betas=(0.9, 0.99), eps=1e-20):
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super().__init__(params, defaults)
+        
+    def step(self):
+        with torch.no_grad():
+            for group in self.param_groups:
+                lr = group["lr"]
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                        
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state["grad_momentum"] = torch.zeros_like(p)
+                        state["grad_squared_momentum"] = torch.zeros_like(p)
+                        
+                    grad_momentum = state["grad_momentum"]
+                    grad_squared_momentum = state["grad_squared_momentum"]
+                    
+                    grad = p.grad
+                    
+                    grad_squared_momentum.mul_(beta2)
+                    grad_squared_momentum.addcmul_(grad, grad, value=1.0 - beta2)
+                    
+                    normalized_grad = grad / (torch.sqrt(grad_squared_momentum) + eps)
+                    
+                    grad_momentum.mul_(beta1)
+                    grad_momentum.add_(normalized_grad, alpha=1.0 - beta1)
+                    
+                    p.add_(grad_momentum, alpha=-lr)       
+        
+        
 class NextStateModel(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.norm1 = RMSNorm()
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm2 = RMSNorm()
         self.posterior_mean = nn.Linear(hidden_dim + state_dim, state_dim)
         self.posterior_log_std = nn.Linear(hidden_dim + state_dim, state_dim)
         self.prior_mean = nn.Linear(hidden_dim, state_dim)
@@ -23,8 +73,8 @@ class NextStateModel(nn.Module):
     
     def observe(self, state, action, next_state):
         x = torch.cat([state, action], dim=-1)
-        x = F.elu(self.fc1(x))
-        x = F.elu(self.fc2(x))
+        x = F.silu(self.norm1(self.fc1(x)))
+        x = F.silu(self.norm2(self.fc2(x)))
         
         posterior_input = torch.cat([x, next_state], dim=-1)               
         posterior_mean = self.posterior_mean(posterior_input)
@@ -43,8 +93,8 @@ class NextStateModel(nn.Module):
         
     def imagine(self, state, action):
         x = torch.cat([state, action], dim=-1)
-        x = F.elu(self.fc1(x))
-        x = F.elu(self.fc2(x))
+        x = F.silu(self.norm1(self.fc1(x)))
+        x = F.silu(self.norm2(self.fc2(x)))
         prior_mean = self.prior_mean(x)
         prior_log_std = torch.clamp(self.prior_log_std(x), -5, 2)
         prior_std = torch.exp(prior_log_std)
@@ -57,7 +107,9 @@ class RewardModel(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.norm1 = RMSNorm()
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm2 = RMSNorm()
         self.reward = nn.Linear(hidden_dim, 1)
         
         nn.init.zeros_(self.reward.weight)
@@ -65,8 +117,8 @@ class RewardModel(nn.Module):
         
     def forward(self, state, action):
         x = torch.cat([state, action], dim=-1)
-        x = F.elu(self.fc1(x))
-        x = F.elu(self.fc2(x))
+        x = F.silu(self.norm1(self.fc1(x)))
+        x = F.silu(self.norm2(self.fc2(x)))
         reward = self.reward(x)
         return reward
         
@@ -75,13 +127,15 @@ class ContinueModel(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.norm1 = RMSNorm()
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm2 = RMSNorm()
         self.continue_logit = nn.Linear(hidden_dim, 1)
 
     def forward(self, state, action):
         x = torch.cat([state, action], dim=-1)
-        x = F.elu(self.fc1(x))
-        x = F.elu(self.fc2(x))
+        x = F.silu(self.norm1(self.fc1(x)))
+        x = F.silu(self.norm2(self.fc2(x)))
         logit = self.continue_logit(x)
         return logit
         
@@ -141,13 +195,15 @@ class Actor(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.norm1 = RMSNorm()
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm2 = RMSNorm()
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))       
+        x = F.silu(self.norm1(self.fc1(state)))
+        x = F.silu(self.norm2(self.fc2(x)))   
         mean = self.mean(x)        
         log_std = self.log_std(x)
         log_std = torch.clamp(log_std, -20, 2)
@@ -178,15 +234,17 @@ class Critic(nn.Module):
     def __init__(self, state_dim, hidden_dim=256):
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.norm1 = RMSNorm()
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.norm2 = RMSNorm()
         self.value = nn.Linear(hidden_dim, 1)
         
         nn.init.zeros_(self.value.weight)
         nn.init.zeros_(self.value.bias)
         
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+        x = F.silu(self.norm1(self.fc1(state)))
+        x = F.silu(self.norm2(self.fc2(x)))
         value = self.value(x)
         return value
         
@@ -195,29 +253,33 @@ class Agent(nn.Module):
     def __init__(self, state_dim, action_dim, lr=3e-4):
         super().__init__()
         self.world_model = WorldModel(state_dim, action_dim)
-        self.critic = Critic(state_dim)
         self.actor = Actor(state_dim, action_dim)
+        self.critic = Critic(state_dim)
+        self.target_critic = Critic(state_dim)
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        for p in self.target_critic.parameters():
+            p.requires_grad = False
 
-        self.world_model_optimizer = torch.optim.Adam(self.world_model.parameters(), lr=lr)        
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)        
+        self.world_model_optimizer = LaProp(self.world_model.parameters(), lr=lr)        
+        self.critic_optimizer = LaProp(self.critic.parameters(), lr=lr)        
         
         #==========================================
         ### Load Actor (fc1, fc2, mean) ###
         
-        state_dict = torch.load(f"{BASE_DIR}/previous_model.pth")
-        self.actor.fc1.load_state_dict({"weight": state_dict["fc1.weight"], "bias": state_dict["fc1.bias"]})
-        self.actor.fc2.load_state_dict({"weight": state_dict["fc2.weight"], "bias": state_dict["fc2.bias"]})
-        self.actor.mean.load_state_dict({"weight": state_dict["mean.weight"], "bias": state_dict["mean.bias"]})
+        #state_dict = torch.load(f"{BASE_DIR}/previous_model.pth")
+        #self.actor.fc1.load_state_dict({"weight": state_dict["fc1.weight"], "bias": state_dict["fc1.bias"]})
+        #self.actor.fc2.load_state_dict({"weight": state_dict["fc2.weight"], "bias": state_dict["fc2.bias"]})
+        #self.actor.mean.load_state_dict({"weight": state_dict["mean.weight"], "bias": state_dict["mean.bias"]})
         
-        with torch.no_grad():        
-            self.actor.log_std.weight.zero_()
-            self.actor.log_std.bias.fill_(-2)        
+        #with torch.no_grad():        
+        #    self.actor.log_std.weight.zero_()
+        #    self.actor.log_std.bias.fill_(-2)        
         
         #==========================================
         
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.actor_optimizer = LaProp(self.actor.parameters(), lr=lr)
         
-    def imagine(self, state, horizon=5):
+    def imagine(self, state, horizon=15):
         imagined_states = []
         imagined_actions = []
         imagined_rewards = []
@@ -254,7 +316,7 @@ class Agent(nn.Module):
        
         return imagined_states, imagined_actions, imagined_rewards, imagined_next_states, imagined_continuations, imagined_log_probs, imagined_entropies
     
-    def compute_return(self, rewards, next_values, continuations, gamma=0.99, lambda_=0.95):
+    def compute_return(self, rewards, next_values, continuations, gamma=0.997, lambda_=0.95):
         B, H, _ = rewards.shape
         returns = torch.zeros_like(rewards)
         next_returns = next_values[:, -1, :]
@@ -263,7 +325,26 @@ class Agent(nn.Module):
             next_returns = rewards[:, t, :] + gamma * continuations[:, t, :] * ((1 - lambda_) * next_values[:, t, :] + lambda_ * next_returns)            
             returns[:, t, :] = next_returns
             
-        return returns  
+        return returns
+        
+    def target_critic_update(self, tau=0.005):
+        with torch.no_grad():
+            for target_param, param in zip(self.target_critic.parameters(), self.critic.parameters()):
+                target_param.mul_(1.0 - tau)
+                target_param.add_(tau * param.data)  
+                
+    def adaptive_grad_clip(self, parameters, clip_factor=0.3, eps=1e-3):
+        with torch.no_grad():
+            for p in parameters:
+                if p.grad is None:
+                    continue
+
+                param_norm = torch.norm(p)
+                grad_norm = torch.norm(p.grad)
+
+                max_norm = (param_norm + eps) * clip_factor
+                if grad_norm > max_norm:
+                    p.grad.mul_(max_norm / (grad_norm + 1e-6))
                 
     def world_model_update(self, batch):
         state = torch.FloatTensor(batch['state'])
@@ -276,7 +357,7 @@ class Agent(nn.Module):
         world_model_loss, next_state_loss, reward_loss, continue_loss, dist_loss = self.world_model.loss(state, action, next_state, reward, continuation)
         self.world_model_optimizer.zero_grad()
         world_model_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), 1.0)
+        self.adaptive_grad_clip(self.world_model.parameters())
         self.world_model_optimizer.step()       
         
         return {
@@ -305,14 +386,16 @@ class Agent(nn.Module):
         imagined_states, _, imagined_rewards, imagined_next_states, imagined_continuations, _, _ = self.imagine(state)
         imagined_values = self.critic(imagined_states)
         with torch.no_grad():
-            imagined_next_values = self.critic(imagined_next_states)
+            imagined_next_values = self.target_critic(imagined_next_states)
             returns = self.compute_return(imagined_rewards, imagined_next_values, imagined_continuations)
         
         critic_loss = F.mse_loss(imagined_values, returns)        
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
+        self.adaptive_grad_clip(self.critic.parameters())
         self.critic_optimizer.step()
+                
+        self.target_critic_update()
         
         for p in self.world_model.parameters():
             p.requires_grad = True 
@@ -340,6 +423,7 @@ class Agent(nn.Module):
         actor_loss = -(advantages * imagined_log_probs).mean() - eta * imagined_entropies.mean()              
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        self.adaptive_grad_clip(self.actor.parameters())
         self.actor_optimizer.step()
         
         for p in self.world_model.parameters():
@@ -351,6 +435,38 @@ class Agent(nn.Module):
             "critic_loss": critic_loss.item(),
             "actor_loss": actor_loss.item(),
         }
+        
+    def save_checkpoint(self, path, buffer, online_buffer):
+        torch.save({
+            "world_model": self.world_model.state_dict(),
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "target_critic": self.target_critic.state_dict(),
+            
+            "world_model_optimizer": self.world_model_optimizer.state_dict(),
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            
+            "buffer": buffer,
+            "online_buffer": online_buffer,
+        }, path)
+        
+    def load_checkpoint(self, path):
+        checkpoint = torch.load(path)
+
+        self.world_model.load_state_dict(checkpoint["world_model"])
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.critic.load_state_dict(checkpoint["critic"])
+        self.target_critic.load_state_dict(checkpoint["target_critic"])
+
+        self.world_model_optimizer.load_state_dict(checkpoint["world_model_optimizer"])
+        self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])
+
+        buffer = checkpoint["buffer"]
+        online_buffer = checkpoint["online_buffer"]
+
+        return buffer, online_buffer
         
         
 class ReplayBuffer:
@@ -404,14 +520,16 @@ if __name__ == "__main__":
     state_dim = spec.observation_specs[0].shape[0]
     action_dim = spec.action_spec.continuous_size
     agent = Agent(state_dim, action_dim)
-    buffer = ReplayBuffer(state_dim, action_dim)
+    buffer = ReplayBuffer(state_dim, action_dim, batch_size=192)
+    online_buffer = ReplayBuffer(state_dim, action_dim, max_size=int(1e3), batch_size=64)
     writer = SummaryWriter(log_dir=BASE_DIR)
     
-    # Set random_exploration_steps, learning_starts to 0
-    #load_checkpoint(f"{BASE_DIR}/checkpoint.pth", agent, buffer)
+    #buffer, online_buffer = agent.load_checkpoint(f"{BASE_DIR}/checkpoint.pth")
     
     random_exploration_steps = 1000
     learning_starts = 500
+    ac_update_start = 5000
+    ac_update_interval = 4
     test_interval = 1000
     test_max_step = 1000
     
@@ -456,15 +574,32 @@ if __name__ == "__main__":
                 continue
                 
             buffer.add(state, action, reward, next_state, done)
+            online_buffer.add(state, action, reward, next_state, done)
             total_steps += 1
         
         if total_steps >= learning_starts:
             batch = buffer.sample()
+            online_batch = online_buffer.sample()
+            batch = {
+                "state": np.concatenate([batch["state"], online_batch["state"]], axis=0),
+                "action": np.concatenate([batch["action"], online_batch["action"]], axis=0),
+                "reward": np.concatenate([batch["reward"], online_batch["reward"]], axis=0),
+                "next_state": np.concatenate([batch["next_state"], online_batch["next_state"]], axis=0),
+                "done": np.concatenate([batch["done"], online_batch["done"]], axis=0),
+            }
             wm_metrics = agent.world_model_update(batch)
             world_model_steps += 1
 
-            if world_model_steps >= 10000:
+            if world_model_steps >= ac_update_start and world_model_steps % ac_update_interval == 0:
                 batch = buffer.sample()
+                online_batch = online_buffer.sample() 
+                batch = {
+                    "state": np.concatenate([batch["state"], online_batch["state"]], axis=0),
+                    "action": np.concatenate([batch["action"], online_batch["action"]], axis=0),
+                    "reward": np.concatenate([batch["reward"], online_batch["reward"]], axis=0),
+                    "next_state": np.concatenate([batch["next_state"], online_batch["next_state"]], axis=0),
+                    "done": np.concatenate([batch["done"], online_batch["done"]], axis=0),
+                }
                 metrics = agent.update(batch) 
                 update_count += 1
                 for k, v in wm_metrics.items():
@@ -517,7 +652,7 @@ if __name__ == "__main__":
                     writer.add_scalar("Test/Average_Reward", test_average_reward, update_count)
                     print(f"{test_average_reward:.4f}")
                     torch.save(agent.actor.state_dict(), f"{BASE_DIR}/period_model.pth")
-                    #save_checkpoint(f"{BASE_DIR}/checkpoint.pth", agent, buffer)                    
+                    agent.save_checkpoint(f"{BASE_DIR}/checkpoint.pth", buffer, online_buffer)
                          
                     if test_average_reward > best_test_reward:
                         best_test_reward = test_average_reward
