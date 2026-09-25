@@ -4,3 +4,15 @@ The 2018 World Model that I implemented last time failed to achieve satisfactory
 Although I continued trying to implement V1, it failed to achieve any meaningful performance, and I could not find out what caused the problem. So, I tried another approach that was using SAC that I had previously implemented as a starting point, and I could find out what caused the problem: RSSM (Recurrent State-Space Model). RSSM is a method that uses GRU and latent. When I used both or either one individually, reward did not increase within a short time, but increased when removing both. Reward might have increased if training had continued for several hours or days, but I did not do so because it would take too much time to run multiple experiments. While RSSM is beneficial for image inputs because they consist of high-dimensional pixel values, it is not essential for state vector inputs, and the model can learn faster without it, which led me to remove it.
 
 Unlike the 2018 World Model, Dreamer repeatedly updates world model and actor-critic in sequence, allowing world model to learn from new experiences and reduce prediction error. However, simply doing this still left some prediction errors, causing reward to decrease over time and leading to a complete collapse. I was able to significantly reduce world model loss and improve actor-critic by applying various techniques described in V1–V3, but I only applied the techniques that worked well or that I considered necessary.
+
+## Diagram
+![diagram](images/diagram.png)
+
+Here are some of the techniques applied in this implementation. There are other techniques as well, but they are not mentioned here for brevity.
+
+### RMSNorm
+### Next State Model (posterior/prior, mean/std, loss)
+### adaptive_grad_clip
+### Laprop
+### return spread
+### actor loss
