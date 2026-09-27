@@ -11,6 +11,10 @@ Unlike the 2018 World Model, Dreamer repeatedly updates world model and actor-cr
 Here are some of the techniques applied in this implementation. There are other techniques as well, but they are not mentioned here for brevity.
 
 ### RMSNorm
+
+RMSNorm is a normalization that applies square-mean-root to the input, and then divides the input by this value to make the input's scale around 1. By doing this, even if the input becomes extremely large or small, its scale is adjusted to around 1, which helps prevent gradient exploding and gradient vanishing. Although it may slow down learning convergence when the gradient is reasonably large, it can help achieve better final performance. The original RMSNorm has learnable parameters that allow the normalized values to be adjusted, but I did not include them because they slowed down learning convergence in the early stages of training.
+
+
 ### Next State Model (posterior/prior, mean/std, loss)
 ### adaptive_grad_clip
 ### Laprop
