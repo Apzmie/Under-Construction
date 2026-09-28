@@ -16,6 +16,10 @@ Here are some of the techniques applied in this implementation. There are other 
 RMSNorm is a normalization that applies square-mean-root to the input, and then divides the input by this value to make the input's scale around 1. This helps prevent gradient explosion and vanishing when the input becomes extremely large or small. Although it may slow down learning convergence when the gradient is reasonably large, it can help achieve better final performance. The original RMSNorm has learnable parameters that allow the normalized values to be adjusted, but I did not include them because they slowed down learning convergence in the early stages of training.
 
 ### Next State Model (posterior/prior, mean/std, loss)
+
+The basic approach to predicting next state is to make the prediction without seeing actual next state, like Prior. However, adding Posterior that sees actual next state and training Prior/Posterior distributions can improve prediction accuracy because Posterior takes the answer as input. In dynamics loss, stop gradient to Posterior so that Prior learns Posterior's next state distribution. In representation loss, stop gradient to Prior so that Posterior learns prior's representation to help Prior predict better, and multiply this loss by 0.1 to prevent weakening Posterior's performance. Also, apply max 1 to both losses to make their gradients 0 when they are below 1, focusing more on other parts when they are sufficiently small. Lastly, use MSE to make Posterior match the actual next state, so that both distributions can be learned correctly. Additionally, Mean/Std approach enables expressing uncertainty and representing multiple possible predictions, which can improve prediction accuracy as well.
+
+
 ### adaptive_grad_clip
 ### Laprop
 ### return spread
