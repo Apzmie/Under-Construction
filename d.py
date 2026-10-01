@@ -22,6 +22,48 @@ class RMSNorm(nn.Module):
         return x / rms
         
         
+class Adam(torch.optim.Optimizer):
+    def __init__(self, params, lr, betas=(0.9, 0.999), eps=1e-8):
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super().__init__(params, defaults)
+        
+    def step(self):
+        with torch.no_grad():
+            for group in self.param_groups:
+                lr = group["lr"]
+                beta1, beta2 = group["betas"]
+                eps = group["eps"]
+                
+                for p in group["params"]:
+                    if p.grad is None:
+                        continue
+                                    
+                    state = self.state[p]                   
+                    if len(state) == 0:
+                        state["step"] = 0
+                        state["grad_momentum"] = torch.zeros_like(p)
+                        state["grad_squared_momentum"] = torch.zeros_like(p)
+                        
+                    grad_momentum = state["grad_momentum"]
+                    grad_squared_momentum = state["grad_squared_momentum"]
+                    
+                    state["step"] += 1
+                    step = state["step"]
+                    
+                    grad = p.grad
+                    
+                    grad_momentum.mul_(beta1)
+                    grad_momentum.add_(grad, alpha=1.0 - beta1)
+                    
+                    grad_squared_momentum.mul_(beta2)
+                    grad_squared_momentum.addcmul_(grad, grad, value=1.0 - beta2)
+                    
+                    bias_correction1 = grad_momentum / (1.0 - beta1 ** step)
+                    bias_correction2 = grad_squared_momentum / (1.0 - beta2 ** step)
+        
+                    p.addcdiv_(bias_correction1, torch.sqrt(bias_correction2) + eps, value=-lr)                                      
+        
+        
 class LaProp(torch.optim.Optimizer):
     def __init__(self, params, lr, betas=(0.9, 0.99), eps=1e-20):
         defaults = dict(lr=lr, betas=betas, eps=eps)
@@ -40,23 +82,29 @@ class LaProp(torch.optim.Optimizer):
                         
                     state = self.state[p]
                     if len(state) == 0:
+                        state["step"] = 0
                         state["grad_momentum"] = torch.zeros_like(p)
                         state["grad_squared_momentum"] = torch.zeros_like(p)
                         
                     grad_momentum = state["grad_momentum"]
                     grad_squared_momentum = state["grad_squared_momentum"]
                     
+                    state["step"] += 1
+                    step = state["step"]
+                    
                     grad = p.grad
                     
                     grad_squared_momentum.mul_(beta2)
                     grad_squared_momentum.addcmul_(grad, grad, value=1.0 - beta2)
+                    bias_correction2 = grad_squared_momentum / (1.0 - beta2 ** step)
                     
-                    normalized_grad = grad / (torch.sqrt(grad_squared_momentum) + eps)
+                    normalized_grad = grad / (torch.sqrt(bias_correction2) + eps)
                     
                     grad_momentum.mul_(beta1)
                     grad_momentum.add_(normalized_grad, alpha=1.0 - beta1)
+                    bias_correction1 = grad_momentum / (1.0 - beta1 ** step)
                     
-                    p.add_(grad_momentum, alpha=-lr)       
+                    p.add_(bias_correction1, alpha=-lr)     
         
         
 class NextStateModel(nn.Module):
