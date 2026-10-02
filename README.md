@@ -25,6 +25,8 @@ The basic approach to predicting next state is to make the prediction without se
 
 Before updating parameters, gradient clipping is often used to prevent gradient explosion by limiting the magnitude of gradients. I have used a gradient clipping method that limits the gradient magnitude to 1 for all parameters so far. But here, the adaptive method is used to limit the gradient magnitude relative to the size of each parameter. If the gradient magnitude exceeds 30% of the parameter magnitude, the gradient is reduced to 30% of the parameter magnitude. 1e-3 is added to the parameter magnitude so that gradients are not clipped to become too small when the parameter magnitude is already small. The reason for comparing the gradient with the parameter is that gradient can be relatively large or small depending on the size of the parameter. So, this adaptive method can better handle increases in gradient magnitude than the fixed-threshold method.
 
-### Laprop
+### Adam vs <ins>LaProp</ins>
+Before going into detail, Adam stands for Adaptive Moment Estimation, and LaProp, I could not find what exactly it stands for, seems to stand for Learning rate Adaptive Propagation. Both use momentum to adjust learning rate for each parameter, so the names do not really distinguish between them. 
+
 ### return spread
 ### actor loss
