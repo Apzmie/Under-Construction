@@ -16,12 +16,12 @@ Here are some of the techniques applied in this implementation. There are other 
 RMSNorm is a normalization that applies square-mean-root to the input, and then divides the input by this value to make the input's scale around 1. This helps prevent gradient explosion and vanishing when the input becomes extremely large or small. Although it may slow down learning convergence when the gradient is reasonably large, it can help achieve better final performance. The original RMSNorm has learnable parameters that allow the normalized values to be adjusted, but I did not include them because they slowed down learning convergence in the early stages of training.
 
 ### Next State Model (Posterior/Prior, Mean/Std)
-<img src="images/next_state_model.png" alt="next_state_model" width="700">
+<img src="images/next_state_model.png" alt="next_state_model" width="600">
 
 The basic approach to predicting next state is to make the prediction without seeing actual next state, like Prior. However, adding Posterior that sees actual next state and training Prior/Posterior distributions can improve prediction accuracy because Posterior takes the answer as input. In dynamics loss, stop gradient to Posterior so that Prior learns Posterior's next state distribution. In representation loss, stop gradient to Prior so that Posterior learns prior's representation to help Prior predict better, and multiply this loss by 0.1 to prevent weakening Posterior's performance. Also, apply max 1 to both losses to make their gradients 0 when they are below 1, preventing bad shortcuts such as increasing Std to make the distributions too similar. Lastly, use MSE to make Posterior match the actual next state, so that both distributions can be learned correctly. Additionally, Mean/Std approach enables expressing uncertainty and representing multiple possible predictions, which can improve prediction accuracy as well.
 
 ### Adaptive Gradient Clipping
-<img src="images/adaptive_grad_clip.png" alt="adaptive_grad_clip" width="600">
+<img src="images/adaptive_grad_clip.png" alt="adaptive_grad_clip" width="500">
 
 Before updating parameters, gradient clipping is often used to prevent gradient explosion by limiting the magnitude of gradients. I have used a gradient clipping method that limits the gradient magnitude to 1 for all parameters so far. But here, the adaptive method is used to limit the gradient magnitude relative to the size of each parameter. If the gradient magnitude exceeds 30% of the parameter magnitude, the gradient is reduced to 30% of the parameter magnitude. 1e-3 is added to the parameter magnitude so that gradients are not clipped to become too small when the parameter magnitude is already small. The reason for comparing the gradient with the parameter is that gradient can be relatively large or small depending on the size of the parameter. So, this adaptive method can better handle increases in gradient magnitude than the fixed-threshold method.
 
