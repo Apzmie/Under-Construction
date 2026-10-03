@@ -28,7 +28,10 @@ Before updating parameters, gradient clipping is often used to prevent gradient 
 ### Adam vs <ins>LaProp</ins>
 Before going into detail, Adam stands for Adaptive Moment Estimation, and LaProp, I could not find what exactly it stands for, seems to stand for Learning rate Adaptive Propagation. Both use momentum to adjust learning rate for each parameter, so the names do not really distinguish between them. The main difference lies in the order of computing GM and GSM.
 
-Looking at Adam first, GM adjusts the update direction, while GSM adjusts the update magnitude, and both use momentum that gives more weight to previous values to avoid being overly affected by sudden changes in the gradient.
+Looking at Adam first, GM adjusts the update direction, while GSM adjusts the update magnitude, and both use momentum that gives more weight to previous values to avoid being overly affected by sudden changes in the gradient. And then, since both GM and GSM are initially 0, correction is applied to prevent them from becoming too small at the beginning. Finally, The learning rate is multiplied by GM and divided by the square root of GSM.
+
+For LaProp, however, GSM is first calculated to obtain the normalized gradient, and then this normalized gradient is used to calculate GM. The reason for using the normalized gradient is to reduce the effect of the gradient's magnitude when calculating GM, allowing GM to focus more on its direction. This helps world models, where accuracy is important, converge smoothly by reducing sudden changes in updates, although it may lose some useful gradient magnitude information.
+
 
 ### return spread
 ### actor loss
