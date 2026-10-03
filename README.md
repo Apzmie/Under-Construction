@@ -30,8 +30,7 @@ Before going into detail, Adam stands for Adaptive Moment Estimation, and LaProp
 
 Looking at Adam first, GM adjusts the update direction, while GSM adjusts the update magnitude, and both use momentum that gives more weight to previous values to avoid being overly affected by sudden changes in the gradient. And then, since both GM and GSM are initially 0, correction is applied to prevent them from becoming too small at the beginning. Finally, The learning rate is multiplied by GM and divided by the square root of GSM.
 
-For LaProp, however, GSM is first calculated to obtain the normalized gradient, and then this normalized gradient is used to calculate GM. The reason for using the normalized gradient is to reduce the effect of the gradient's magnitude when calculating GM, allowing GM to focus more on its direction. This helps world models, where accuracy is important, converge smoothly by reducing sudden changes in updates, although it may lose some useful gradient magnitude information.
-
+For LaProp, however, GSM is first calculated to obtain the normalized gradient, and then this normalized gradient is used to calculate GM. The reason for using the normalized gradient is to reduce the effect of the gradient's magnitude when calculating GM, allowing GM to focus more on its direction. This helps world models, where accuracy is important, converge smoothly by reducing sudden changes in updates, although it may lose some useful gradient magnitude information. β₂ is set to 0.99 instead of 0.999 to respond more quickly to recent changes, and ε is set to 10⁻²⁰ instead of 10⁻⁸ to minimize its effect on normalization. However, if √GSM becomes as small as 10⁻²⁰, the normalized gradient can become extremely large. Because gradients are usually not that small to make √GSM extremely small and this process is not the final operation, this is unlikely to cause a problem.
 
 ### return spread
 ### actor loss
