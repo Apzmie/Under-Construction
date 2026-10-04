@@ -34,5 +34,7 @@ Looking at Adam first, GM adjusts the update direction, while GSM adjusts the up
 
 For LaProp, however, GSM is first calculated to obtain the normalized gradient, and then this normalized gradient is used to calculate GM. The reason for using the normalized gradient is to reduce the effect of the gradient's magnitude when calculating GM, allowing GM to focus more on its direction. This helps world models, where accuracy is important, converge smoothly by reducing sudden changes in updates, although it may lose some useful gradient magnitude information. β₂ is set to 0.99 instead of 0.999 to respond more quickly to recent changes, and ε is set to 10⁻²⁰ instead of 10⁻⁸ to minimize its effect on normalization. However, if √GSM becomes as small as 10⁻²⁰, the normalized gradient can become extremely large. Because gradients are usually not that small to make √GSM extremely small and this process is not the final operation, this is unlikely to cause a problem.
 
-### return spread
+### Advantage Normalization
+Although reward range is narrow like -1 ~ 1, return can vary in magnitude, which can cause large return values obtained by chance to dominate the advantage and result in excessively large policy updates. To reduce this situation, calculate the return spread using P5 and P95 instead of P0 and P100 to reduce the influence of extreme return values, and use it to normalize the advantage. The reason for max(S,1) is to prevent the advantage from becoming larger.
+
 ### actor loss
