@@ -39,4 +39,9 @@ For LaProp, however, GSM is first calculated to obtain the normalized gradient, 
 
 Although reward range is narrow like -1 ~ 1, return can vary in magnitude, which can cause large return values obtained by chance to dominate the advantage and result in excessively large policy updates. To reduce this situation, calculate the return spread using P5 and P95 instead of P0 and P100 to reduce the influence of extreme return values, and use it to normalize the advantage. The reason for max(S,1) is to prevent the advantage from becoming larger.
 
-### actor loss
+### Actor Loss
+There are two possible forms of the actor loss. The former optimizes the return, which is used in V1 and V2 for continuous actions. The latter optimizes the probability of actions based on the advantage, which is used in V3 for both discrete and continuous actions.
+
+## Training Progress
+
+## Conclusion
