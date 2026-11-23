@@ -57,7 +57,7 @@ class Critic(nn.Module):
         
         
 class Agent:
-    def __init__(self, state_dim, action_dim, lr=3e-4, num_critics=3, num_quantiles=15, drop_per_critic=2):
+    def __init__(self, state_dim, action_dim, lr=3e-4, num_critics=3, num_quantiles=15, top_quantiles_to_drop=6):
         self.actor = Actor(state_dim, action_dim)        
         self.critics = nn.ModuleList([
             Critic(state_dim, action_dim, num_quantiles) for _ in range(num_critics)
@@ -82,7 +82,9 @@ class Agent:
         self.target_entropy = -action_dim
         self.num_critics = num_critics
         self.num_quantiles = num_quantiles
-        self.top_quantiles_to_drop = num_critics * drop_per_critic        
+        self.top_quantiles_to_drop = top_quantiles_to_drop
+        self.min_drop = num_critics
+        self.max_drop = num_quantiles       
     
     def update_target_critic(self, tau=0.005):
         with torch.no_grad():
@@ -117,7 +119,9 @@ class Agent:
             target_quantiles = reward + gamma * (1 - done) * (truncated_next_quantiles - alpha * next_log_prob)
 
         current_quantiles_list = [critic(state, action) for critic in self.critics]
-        critic_losses = []        
+        critic_losses = []
+        total_one_count = 0
+        total_zero_count = 0        
         for n, critic_optimizer in enumerate(self.critic_optimizers):
             pred_quantiles = current_quantiles_list[n]  # (batch_size, num_quantiles)            
             error = target_quantiles.unsqueeze(1) - pred_quantiles.unsqueeze(2)  # (batch_size, 1, num_atoms_to_keep) - (batch_size, num_quantiles, 1) = (batch_size, num_quantiles, num_atoms_to_keep)  
@@ -133,6 +137,18 @@ class Agent:
             critic_optimizer.step()
                         
             critic_losses.append(critic_loss.item())
+            
+            with torch.no_grad():
+                zero_and_one = error < 0
+                one_count = zero_and_one.sum().item()
+                zero_count = zero_and_one.numel() - one_count
+                total_one_count += one_count
+                total_zero_count += zero_count
+                
+        if total_one_count > total_zero_count:
+            self.top_quantiles_to_drop = min(self.top_quantiles_to_drop + 1, self.max_drop)
+        elif total_zero_count > total_one_count:
+            self.top_quantiles_to_drop = max(self.top_quantiles_to_drop - 1, self.min_drop)
         
         #==========================================
         
@@ -175,6 +191,7 @@ class Agent:
             "alpha": self.log_alpha.exp().item(),
             "target_quantiles": target_quantiles.mean().item(),
             "q_value": q_value.mean().item(),
+            "top_quantiles_to_drop": self.top_quantiles_to_drop,
         }
         
     def save_checkpoint(self, path, buffer):
