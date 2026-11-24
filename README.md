@@ -14,4 +14,7 @@ The initial numbers before calculating the error are just set randomly for the e
 6. Finally, multiply `quantile_weight` and `smooth_l1_loss` element-wise, sum horizontally first and then take the mean vertically to get a scalar that becomes the critic loss. It is important not to just take the mean of entire elements because the number of quantiles is repeatedly added up unnecessarily, weakening the learning signal.
 7. Assuming the critic predicts the quantiles properly, in the actor loss, instead of picking the smallest value, take the mean and use it to update the actor. This is how it avoids overestimation while also avoiding underestimation. There is no truncation in the actor loss procedure because the critic's output has already learned truncation.
 
+### Automatic Adjustment of Dropped Quantiles
+There are papers that show some ways to automatically adjust TQC's `top_quantiles_to_drop`, such as comparing actual return with the critic's prediction. However, I came up with a simpler idea to adjust it: comparing the counts of 0s and 1s from evaluating (error < 0). If there are more 1s than 0s, it means overestimation, so `top_quantiles_to_drop`+1 to decrease the critic's prediction value. If there are more 0s than 1s, it means underestimation, so `top_quantiles_to_drop`-1 to increase the critic's prediction value.
 
+I set the adjustment period to every update, set `min_drop` and `max_drop` to prevent excessive adjustment, and ran experiments on HalfCheetah-v5 with all random seeds fixed.
