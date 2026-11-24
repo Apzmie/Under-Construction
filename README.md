@@ -17,4 +17,7 @@ The initial numbers before calculating the error are just set randomly for the e
 ### Automatic Adjustment of Dropped Quantiles
 There are papers that show some ways to automatically adjust TQC's `top_quantiles_to_drop`, such as comparing actual return with the critic's prediction. However, I came up with a simpler idea to adjust it: comparing the counts of 0s and 1s from evaluating (error < 0). If there are more 1s than 0s, it means overestimation, so `top_quantiles_to_drop`+1 to decrease the critic's prediction value. If there are more 0s than 1s, it means underestimation, so `top_quantiles_to_drop`-1 to increase the critic's prediction value.
 
-I set the adjustment period to every update, set `min_drop` and `max_drop` to prevent excessive adjustment, and ran experiments on HalfCheetah-v5 with all random seeds fixed.
+I set the adjustment period to every update, set `min_drop` and `max_drop` to prevent excessive adjustment, and ran experiments on HalfCheetah-v5 with all random seeds fixed. In max 100,000 steps, both SAC and TQC (fixed drop of 6) achieved over a reward of 6,000 near the end, while TQC (automatic adjustment) showed larger reward fluctuations in the early stages—maybe because of adjusting on every step—achieved over 6,000 faster and reached higher than them.
+
+These results prove that adjusting `top_quantiles_to_drop` is better than a fixed drop when overestimation or underestimation occurs. I think the reason adjusting on every step leads to fluctuations is that the target criterion of the critic keeps shifting while its predictions are messy early on, and it did not collapse because rewards kept increasing even with fluctuations.
+
