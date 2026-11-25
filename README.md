@@ -1,4 +1,5 @@
 # Under-Construction
+Although SAC has become one of the standard algorithms for continuous action control, it suffers from over- and underestimation in the critic's prediction, which slow down learning and limit best performance. For example, even when two critics independently estimate values and take the minimum to mitigate overestimation, selecting the smaller value still results in overestimation if both estimates are overestimated, and still results in underestimation if both are underestimated. So, this approach has limitations in preventing both, and TQC (Truncated Quantile Critics)  was introduced to solve these limitations. Instead of predicting a single value, multiple critics predict values corresponding to quantiles, and then
 
 ## Critic Loss
 The initial numbers before calculating the error are just set randomly for the example.
@@ -21,3 +22,6 @@ I set the adjustment period to every update, set `min_drop` and `max_drop` to pr
 
 These results prove that adjusting `top_quantiles_to_drop` is better than a fixed drop when overestimation or underestimation occurs. I think the reason adjusting on every step leads to fluctuations is that the target criterion of the critic keeps shifting while its predictions are messy early on, and it did not collapse because rewards kept increasing even with fluctuations.
 
+## Training Progress
+
+## Conclusion
